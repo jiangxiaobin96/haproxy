@@ -230,8 +230,6 @@ static int oldpids_sig; /* use USR1 or TERM */
 /* Path to the unix socket we use to retrieve listener sockets from the old process */
 static const char *old_unixsocket;
 
-static char *cur_unixsocket = NULL;
-
 int atexit_flag = 0;
 
 int nb_oldpids = 0;
@@ -599,6 +597,9 @@ static void usage(char *name)
 #if defined(SO_REUSEPORT)
 		"        -dR disables SO_REUSEPORT usage\n"
 #endif
+#if defined(HA_HAVE_DUMP_LIBS)
+		"        -dL dumps loaded object files after config checks\n"
+#endif
 		"        -dr ignores server address resolution failures\n"
 		"        -dV disables SSL verify on servers side\n"
 		"        -dW fails if any warning is emitted\n"
@@ -651,41 +652,6 @@ int delete_oldpid(int pid)
 }
 
 
-static void get_cur_unixsocket()
-{
-	/* if -x was used, try to update the stat socket if not available anymore */
-	if (global.cli_fe) {
-		struct bind_conf *bind_conf;
-
-		/* pass through all stats socket */
-		list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
-			struct listener *l;
-
-			list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-
-				if (l->rx.addr.ss_family == AF_UNIX &&
-				    (bind_conf->level & ACCESS_FD_LISTENERS)) {
-					const struct sockaddr_un *un;
-
-					un = (struct sockaddr_un *)&l->rx.addr;
-					/* priority to old_unixsocket */
-					if (!cur_unixsocket) {
-						cur_unixsocket = strdup(un->sun_path);
-					} else {
-						if (old_unixsocket && strcmp(un->sun_path, old_unixsocket) == 0) {
-							free(cur_unixsocket);
-							cur_unixsocket = strdup(old_unixsocket);
-							return;
-						}
-					}
-				}
-			}
-		}
-	}
-	if (!cur_unixsocket && old_unixsocket)
-		cur_unixsocket = strdup(old_unixsocket);
-}
-
 /*
  * When called, this function reexec haproxy with -sf followed by current
  * children PIDs and possibly old children PIDs if they didn't leave yet.
@@ -698,7 +664,7 @@ static void mworker_reexec()
 	int i = 0;
 	char *msg = NULL;
 	struct rlimit limit;
-	struct per_thread_deinit_fct *ptdf;
+	struct mworker_proc *current_child = NULL;
 
 	mworker_block_signals();
 #if defined(USE_SYSTEMD)
@@ -709,6 +675,9 @@ static void mworker_reexec()
 
 	mworker_proc_list_to_env(); /* put the children description in the env */
 
+	/* ensure that we close correctly every listeners before reexecuting */
+	mworker_cleanlisteners();
+
 	/* during the reload we must ensure that every FDs that can't be
 	 * reuse (ie those that are not referenced in the proc_list)
 	 * are closed or they will leak. */
@@ -716,13 +685,9 @@ static void mworker_reexec()
 	/* close the listeners FD */
 	mworker_cli_proxy_stop();
 
-	if (getenv("HAPROXY_MWORKER_WAIT_ONLY") == NULL) {
-		/* close the poller FD and the thread waker pipe FD */
-		list_for_each_entry(ptdf, &per_thread_deinit_list, list)
-			ptdf->fct();
-		if (fdtab)
-			deinit_pollers();
-	}
+	if (fdtab)
+		deinit_pollers();
+
 #ifdef HAVE_SSL_RAND_KEEP_RANDOM_DEVICES_OPEN
 	/* close random device FDs */
 	RAND_keep_random_devices_open(0);
@@ -753,24 +718,32 @@ static void mworker_reexec()
 
 	/* insert the new options just after argv[0] in case we have a -- */
 
-	/* add -sf <PID>*  to argv */
-	if (mworker_child_nb() > 0) {
-		struct mworker_proc *child;
+	if (getenv("HAPROXY_MWORKER_WAIT_ONLY") == NULL) {
+		/* add -sf <PID>*  to argv */
+		if (mworker_child_nb() > 0) {
+			struct mworker_proc *child;
 
-		next_argv[next_argc++] = "-sf";
+			next_argv[next_argc++] = "-sf";
 
-		list_for_each_entry(child, &proc_list, list) {
-			if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)) || child->pid <= -1 )
-				continue;
-			if ((next_argv[next_argc++] = memprintf(&msg, "%d", child->pid)) == NULL)
+			list_for_each_entry(child, &proc_list, list) {
+				if (!(child->options & PROC_O_LEAVING) && (child->options & PROC_O_TYPE_WORKER))
+					current_child = child;
+
+				if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)) || child->pid <= -1)
+					continue;
+				if ((next_argv[next_argc++] = memprintf(&msg, "%d", child->pid)) == NULL)
+					goto alloc_error;
+				msg = NULL;
+			}
+		}
+
+		if (current_child) {
+			/* add the -x option with the socketpair of the current worker */
+			next_argv[next_argc++] = "-x";
+			if ((next_argv[next_argc++] = memprintf(&msg, "sockpair@%d", current_child->ipc_fd[0])) == NULL)
 				goto alloc_error;
 			msg = NULL;
 		}
-	}
-	/* add the -x option with the stat socket */
-	if (cur_unixsocket) {
-		next_argv[next_argc++] = "-x";
-		next_argv[next_argc++] = (char *)cur_unixsocket;
 	}
 
 	/* copy the previous options */
@@ -800,8 +773,13 @@ static void mworker_reexec_waitmode()
 void mworker_reload()
 {
 	struct mworker_proc *child;
+	struct per_thread_deinit_fct *ptdf;
 
 	ha_notice("Reloading HAProxy\n");
+
+	/* close the poller FD and the thread waker pipe FD */
+	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
+		ptdf->fct();
 
 	/* increment the number of reloads */
 	list_for_each_entry(child, &proc_list, list) {
@@ -838,7 +816,6 @@ static void mworker_loop()
 	signal_register_fct(SIGCHLD, mworker_catch_sigchld, SIGCHLD);
 
 	mworker_unblock_signals();
-	mworker_cleanlisteners();
 	mworker_cleantasks();
 
 	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
@@ -1658,6 +1635,10 @@ static void init(int argc, char **argv)
 				mem_poison_byte = flag[2] ? strtol(flag + 2, NULL, 0) : 'P';
 			else if (*flag == 'd' && flag[1] == 'r')
 				global.tune.options |= GTUNE_RESOLVE_DONTFAIL;
+#if defined(HA_HAVE_DUMP_LIBS)
+			else if (*flag == 'd' && flag[1] == 'L')
+				arg_mode |= MODE_DUMP_LIBS;
+#endif
 			else if (*flag == 'd')
 				arg_mode |= MODE_DEBUG;
 			else if (*flag == 'c' && flag[1] == 'c') {
@@ -1799,7 +1780,7 @@ static void init(int argc, char **argv)
 
 	global.mode |= (arg_mode & (MODE_DAEMON | MODE_MWORKER | MODE_FOREGROUND | MODE_VERBOSE
 				    | MODE_QUIET | MODE_CHECK | MODE_DEBUG | MODE_ZERO_WARNING
-				    | MODE_DIAG | MODE_CHECK_CONDITION));
+				    | MODE_DIAG | MODE_CHECK_CONDITION | MODE_DUMP_LIBS));
 
 	if (getenv("HAPROXY_MWORKER_WAIT_ONLY")) {
 		unsetenv("HAPROXY_MWORKER_WAIT_ONLY");
@@ -2081,6 +2062,15 @@ static void init(int argc, char **argv)
 		ha_alert("Some warnings were found and 'zero-warning' is set. Aborting.\n");
 		exit(1);
 	}
+
+#if defined(HA_HAVE_DUMP_LIBS)
+	if (global.mode & MODE_DUMP_LIBS) {
+		qfprintf(stdout, "List of loaded object files:\n");
+		chunk_reset(&trash);
+		if (dump_libs(&trash, 0))
+			printf("%s", trash.area);
+	}
+#endif
 
 	if (global.mode & MODE_CHECK) {
 		struct peers *pr;
@@ -2998,7 +2988,12 @@ int main(int argc, char **argv)
 #endif
 	}
 
-	if (old_unixsocket) {
+	/* Try to get the listeners FD from the previous process using
+	 * _getsocks on the stat socket, it must never been done in wait mode
+	 * and check mode
+	 */
+	if (old_unixsocket &&
+	    !(global.mode & (MODE_MWORKER_WAIT|MODE_CHECK|MODE_CHECK_CONDITION))) {
 		if (strcmp("/dev/null", old_unixsocket) != 0) {
 			if (sock_get_old_sockets(old_unixsocket) != 0) {
 				ha_alert("Failed to get the sockets from the old process!\n");
@@ -3007,7 +3002,6 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-	get_cur_unixsocket();
 
 	/* We will loop at most 100 times with 10 ms delay each time.
 	 * That's at most 1 second. We only send a signal to old pids
@@ -3244,12 +3238,12 @@ int main(int argc, char **argv)
 #ifdef USE_CPU_AFFINITY
 		if (!in_parent && ha_cpuset_count(&cpu_map.proc)) {   /* only do this if the process has a CPU map */
 
-#ifdef __FreeBSD__
-			struct hap_cpuset *set = &cpu_map.proc;
-			ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset);
-#elif defined(__linux__) || defined(__DragonFly__)
+#if defined(CPUSET_USE_CPUSET) || defined(__DragonFly__)
 			struct hap_cpuset *set = &cpu_map.proc;
 			sched_setaffinity(0, sizeof(set->cpuset), &set->cpuset);
+#elif defined(__FreeBSD__)
+			struct hap_cpuset *set = &cpu_map.proc;
+			ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset);
 #endif
 		}
 #endif

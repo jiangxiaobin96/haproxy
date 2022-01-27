@@ -518,10 +518,13 @@ int quic_connect_server(struct connection *conn, int flags)
  */
 static void quic_add_listener(struct protocol *proto, struct listener *listener)
 {
-	MT_LIST_INIT(&listener->rx.pkts);
+	listener->flags |= LI_F_QUIC_LISTENER;
+
 	listener->rx.odcids = EB_ROOT_UNIQUE;
 	listener->rx.cids = EB_ROOT_UNIQUE;
+	listener->rx.flags |= RX_F_LOCAL_ACCEPT;
 	HA_RWLOCK_INIT(&listener->rx.cids_lock);
+
 	default_add_listener(proto, listener);
 }
 

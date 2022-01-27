@@ -34,6 +34,8 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 	int freed = 0;
 	int remain;
 
+	BUG_ON(data_len < 0);
+
 	/* not enough usable blocks */
 	if (data_len > shctx->nbav * shctx->block_size)
 		goto out;
@@ -61,7 +63,7 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 				return last ? last : first;
 			} else {
 				data_len -= remain;
-				if (!data_len)
+				if (data_len <= 0)
 					return last ? last : first;
 			}
 		}
@@ -93,6 +95,8 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 			block->len = 0;
 
 			freed++;
+
+			BUG_ON(data_len < 0);
 			data_len -= shctx->block_size;
 
 			if (data_len > 0 || !enough) {
@@ -111,6 +115,7 @@ struct shared_block *shctx_row_reserve_hot(struct shared_context *shctx,
 					ret->refcount = 1;
 					ret->last_reserved = block;
 					enough = 1;
+					break;
 				}
 			}
 			count++;
@@ -212,6 +217,8 @@ int shctx_row_data_append(struct shared_context *shctx,
 
 		/* remaining written bytes in the current block. */
 		remain = (shctx->block_size * first->block_count - first->len) % shctx->block_size;
+		BUG_ON(remain < 0);
+
 		/* if remain == 0, previous buffers are full, or first->len == 0 */
 		if (!remain) {
 			remain = shctx->block_size;
@@ -220,6 +227,7 @@ int shctx_row_data_append(struct shared_context *shctx,
 		else {
 			/* start must be calculated before remain is modified */
 			start = shctx->block_size - remain;
+			BUG_ON(start < 0);
 		}
 
 		/* must not try to copy more than len */
@@ -269,8 +277,11 @@ int shctx_row_data_get(struct shared_context *shctx, struct shared_block *first,
 		if (start == -1)
 			start = offset - (count - 1) * shctx->block_size;
 
+		BUG_ON(start < 0);
+
 		/* size can be lower than a block when copying the last block */
 		size = MIN(shctx->block_size - start, len);
+		BUG_ON(size < 0);
 
 		memcpy(dst, block->data + start, size);
 		dst += size;

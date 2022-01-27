@@ -25,6 +25,7 @@
 #include <haproxy/pipe-t.h>
 #include <haproxy/proxy.h>
 #include <haproxy/session-t.h>
+#include <haproxy/stats.h>
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/trace.h>
@@ -54,7 +55,7 @@
 #define H1C_F_ST_READY       0x00002000 /* Set in ATTACHED state with a READY conn-stream. A conn-stream is not ready when
 					 * a TCP>H1 upgrade is in progress Thus this flag is only set if ATTACHED is also set */
 #define H1C_F_ST_ALIVE       (H1C_F_ST_IDLE|H1C_F_ST_EMBRYONIC|H1C_F_ST_ATTACHED)
-#define H1C_F_ST_SILENT_SHUT 0x00004000 /* silent (or dirty) shutdown must be performed */
+#define H1C_F_ST_SILENT_SHUT 0x00004000 /* silent (or dirty) shutdown must be performed (implied ST_SHUTDOWN) */
 /* 0x00008000 unused */
 
 #define H1C_F_WANT_SPLICE    0x00010000 /* Don't read into a buffer because we want to use or we are using splicing */
@@ -107,6 +108,7 @@ struct h1c {
 
 	struct h1s *h1s;                 /* H1 stream descriptor */
 	struct task *task;               /* timeout management task */
+	struct h1_counters *px_counters; /* h1 counters attached to proxy */
 	int idle_exp;                    /* idle expiration date (http-keep-alive or http-request timeout) */
 	int timeout;                     /* client/server timeout duration */
 	int shut_timeout;                /* client-fin/server-fin timeout duration */
@@ -261,6 +263,92 @@ static struct trace_source trace_h1 __read_mostly = {
 #define TRACE_SOURCE &trace_h1
 INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
+
+/* h1 stats module */
+enum {
+	H1_ST_OPEN_CONN,
+	H1_ST_OPEN_STREAM,
+	H1_ST_TOTAL_CONN,
+	H1_ST_TOTAL_STREAM,
+
+	H1_ST_BYTES_IN,
+	H1_ST_BYTES_OUT,
+#if defined(USE_LINUX_SPLICE)
+	H1_ST_SPLICED_BYTES_IN,
+	H1_ST_SPLICED_BYTES_OUT,
+#endif
+	H1_STATS_COUNT /* must be the last member of the enum */
+};
+
+
+static struct name_desc h1_stats[] = {
+	[H1_ST_OPEN_CONN]            = { .name = "h1_open_connections",
+	                                 .desc = "Count of currently open connections" },
+	[H1_ST_OPEN_STREAM]          = { .name = "h1_open_streams",
+	                                 .desc = "Count of currently open streams" },
+	[H1_ST_TOTAL_CONN]           = { .name = "h1_total_connections",
+	                                 .desc = "Total number of connections" },
+	[H1_ST_TOTAL_STREAM]         = { .name = "h1_total_streams",
+	                                 .desc = "Total number of streams" },
+
+	[H1_ST_BYTES_IN]             = { .name = "h1_bytes_in",
+	                                 .desc = "Total number of bytes received" },
+	[H1_ST_BYTES_OUT]            = { .name = "h1_bytes_out",
+	                                 .desc = "Total number of bytes send" },
+#if defined(USE_LINUX_SPLICE)
+	[H1_ST_SPLICED_BYTES_IN]     = { .name = "h1_spliced_bytes_in",
+		                         .desc = "Total number of bytes received using kernel splicing" },
+	[H1_ST_SPLICED_BYTES_OUT]    = { .name = "h1_spliced_bytes_out",
+		                         .desc = "Total number of bytes sendusing kernel splicing" },
+#endif
+
+};
+
+static struct h1_counters {
+	long long open_conns;          /* count of currently open connections */
+	long long open_streams;       /* count of currently open streams */
+	long long total_conns;        /* total number of connections */
+	long long total_streams;      /* total number of streams */
+
+	long long bytes_in;           /* number of bytes received */
+	long long bytes_out;          /* number of bytes sent */
+#if defined(USE_LINUX_SPLICE)
+	long long spliced_bytes_in;   /* number of bytes received using kernel splicing */
+	long long spliced_bytes_out;  /* number of bytes sent using kernel splicing */
+#endif
+} h1_counters;
+
+static void h1_fill_stats(void *data, struct field *stats)
+{
+	struct h1_counters *counters = data;
+
+	stats[H1_ST_OPEN_CONN]        = mkf_u64(FN_GAUGE,   counters->open_conns);
+	stats[H1_ST_OPEN_STREAM]      = mkf_u64(FN_GAUGE,   counters->open_streams);
+	stats[H1_ST_TOTAL_CONN]       = mkf_u64(FN_COUNTER, counters->total_conns);
+	stats[H1_ST_TOTAL_STREAM]     = mkf_u64(FN_COUNTER, counters->total_streams);
+
+	stats[H1_ST_BYTES_IN]          = mkf_u64(FN_COUNTER, counters->bytes_in);
+	stats[H1_ST_BYTES_OUT]         = mkf_u64(FN_COUNTER, counters->bytes_out);
+#if defined(USE_LINUX_SPLICE)
+	stats[H1_ST_SPLICED_BYTES_IN]  = mkf_u64(FN_COUNTER, counters->spliced_bytes_in);
+	stats[H1_ST_SPLICED_BYTES_OUT] = mkf_u64(FN_COUNTER, counters->spliced_bytes_out);
+#endif
+}
+
+static struct stats_module h1_stats_module = {
+	.name          = "h1",
+	.fill_stats    = h1_fill_stats,
+	.stats         = h1_stats,
+	.stats_count   = H1_STATS_COUNT,
+	.counters      = &h1_counters,
+	.counters_size = sizeof(h1_counters),
+	.domain_flags  = MK_STATS_PROXY_DOMAIN(STATS_PX_CAP_FE|STATS_PX_CAP_BE),
+	.clearable     = 1,
+};
+
+INITCALL1(STG_REGISTER, stats_register_module, &h1_stats_module);
+
+
 /* the h1c and h1s pools */
 DECLARE_STATIC_POOL(pool_head_h1c, "h1c", sizeof(struct h1c));
 DECLARE_STATIC_POOL(pool_head_h1s, "h1s", sizeof(struct h1s));
@@ -299,9 +387,18 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 	chunk_appendf(&trace_buf, " : [%c]", ((h1c->flags & H1C_F_IS_BACK) ? 'B' : 'F'));
 
 	/* Display request and response states if h1s is defined */
-	if (h1s)
+	if (h1s) {
 		chunk_appendf(&trace_buf, " [%s, %s]",
 			      h1m_state_str(h1s->req.state), h1m_state_str(h1s->res.state));
+
+		if (src->verbosity > H1_VERB_SIMPLE) {
+			chunk_appendf(&trace_buf, " - req=(.fl=0x%08x .curr_len=%lu .body_len=%lu)",
+				      h1s->req.flags, (unsigned long)h1s->req.curr_len, (unsigned long)h1s->req.body_len);
+			chunk_appendf(&trace_buf, "  res=(.fl=0x%08x .curr_len=%lu .body_len=%lu)",
+				      h1s->res.flags, (unsigned long)h1s->res.curr_len, (unsigned long)h1s->res.body_len);
+		}
+
+	}
 
 	if (src->verbosity == H1_VERB_CLEAN)
 		return;
@@ -602,6 +699,9 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 		goto err;
 	}
 
+	HA_ATOMIC_INC(&h1s->h1c->px_counters->open_streams);
+	HA_ATOMIC_INC(&h1s->h1c->px_counters->total_streams);
+
 	h1s->h1c->flags = (h1s->h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
 	return cs;
@@ -718,6 +818,9 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	if (h1c->px->options2 & PR_O2_RSPBUG_OK)
 		h1s->res.err_pos = -1;
 
+	HA_ATOMIC_INC(&h1c->px_counters->open_streams);
+	HA_ATOMIC_INC(&h1c->px_counters->total_streams);
+
 	TRACE_LEAVE(H1_EV_H1S_NEW, h1c->conn, h1s);
 	return h1s;
 
@@ -759,6 +862,8 @@ static void h1s_destroy(struct h1s *h1s)
 			TRACE_STATE("set shudown on h1c", H1_EV_H1S_END, h1c->conn, h1s);
 			h1c->flags |= H1C_F_ST_SHUTDOWN;
 		}
+
+		HA_ATOMIC_DEC(&h1c->px_counters->open_streams);
 		pool_free(pool_head_h1s, h1s);
 	}
 }
@@ -809,10 +914,16 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		h1c->shut_timeout = h1c->timeout = proxy->timeout.server;
 		if (tick_isset(proxy->timeout.serverfin))
 			h1c->shut_timeout = proxy->timeout.serverfin;
+
+		h1c->px_counters = EXTRA_COUNTERS_GET(proxy->extra_counters_be,
+		                                      &h1_stats_module);
 	} else {
 		h1c->shut_timeout = h1c->timeout = proxy->timeout.client;
 		if (tick_isset(proxy->timeout.clientfin))
 			h1c->shut_timeout = proxy->timeout.clientfin;
+
+		h1c->px_counters = EXTRA_COUNTERS_GET(proxy->extra_counters_fe,
+		                                      &h1_stats_module);
 
 		LIST_APPEND(&mux_stopping_data[tid].list,
 		            &h1c->conn->stopping_list);
@@ -866,6 +977,9 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 	else if (h1_recv_allowed(h1c))
 		h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 
+	HA_ATOMIC_INC(&h1c->px_counters->open_conns);
+	HA_ATOMIC_INC(&h1c->px_counters->total_conns);
+
 	/* mux->wake will be called soon to complete the operation */
 	TRACE_LEAVE(H1_EV_H1C_NEW, conn, h1c->h1s);
 	return 0;
@@ -876,6 +990,8 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		tasklet_free(h1c->wait_event.tasklet);
 	pool_free(pool_head_h1c, h1c);
  fail_h1c:
+	if (!conn_is_back(conn))
+		LIST_DEL_INIT(&conn->stopping_list);
 	conn->ctx = conn_ctx; // restore saved context
 	TRACE_DEVEL("leaving in error", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
 	return -1;
@@ -935,6 +1051,8 @@ static void h1_release(struct h1c *h1c)
 							&h1c->wait_event);
 			h1_shutw_conn(conn);
 		}
+
+		HA_ATOMIC_DEC(&h1c->px_counters->open_conns);
 		pool_free(pool_head_h1c, h1c);
 	}
 
@@ -1721,8 +1839,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	}
 
 	/* Here h1s->cs is always defined */
-	if (!(h1m->flags & H1_MF_CHNK) &&
-	    ((h1m->state == H1_MSG_DATA && h1m->curr_len) || (h1m->state == H1_MSG_TUNNEL))) {
+	if (!(h1m->flags & H1_MF_CHNK) && (h1m->state == H1_MSG_DATA || (h1m->state == H1_MSG_TUNNEL))) {
 		TRACE_STATE("notify the mux can use splicing", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
 		h1s->cs->flags |= CS_FL_MAY_SPLICE;
 	}
@@ -1848,9 +1965,19 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 			void *old_area;
 
 			TRACE_PROTO("sending message data (zero-copy)", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, chn_htx, (size_t[]){count});
-			if (h1m->state == H1_MSG_DATA && chn_htx->flags & HTX_FL_EOM) {
-				TRACE_DEVEL("last message block", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s);
-				last_data = 1;
+			if (h1m->state == H1_MSG_DATA) {
+				if (h1m->flags & H1_MF_CLEN) {
+					if (count > h1m->curr_len) {
+						TRACE_ERROR("too much payload, more than announced",
+							    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
+						goto error;
+					}
+					h1m->curr_len -= count;
+				}
+				if (chn_htx->flags & HTX_FL_EOM) {
+					TRACE_DEVEL("last message block", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s);
+					last_data = 1;
+				}
 			}
 
 			old_area = h1c->obuf.area;
@@ -2200,9 +2327,18 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 					last_data = 0;
 				}
 
-				if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_RESP)) {
-					TRACE_PROTO("Skip data for bodyless response", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, chn_htx);
-					goto skip_data;
+				if (h1m->state == H1_MSG_DATA) {
+					if (h1m->flags & H1_MF_CLEN) {
+						if (vlen > h1m->curr_len) {
+							TRACE_ERROR("too much payload, more than announced",
+								    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
+							goto error;
+						}
+					}
+					if ((h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_RESP)) {
+						TRACE_PROTO("Skip data for bodyless response", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, chn_htx);
+						goto skip_data;
+					}
 				}
 
 				chklen = 0;
@@ -2243,6 +2379,8 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 						    H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, 0, (size_t[]){v.len});
 
 			  skip_data:
+				if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN))
+					h1m->curr_len -= vlen;
 				if (last_data)
 					goto done;
 				break;
@@ -2329,7 +2467,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 				h1c->flags |= H1C_F_ST_ERROR;
 				TRACE_ERROR("processing output error, set error on h1c/h1s",
 					    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
-				break;
+				goto end;
 		}
 
 	  nextblk:
@@ -2634,6 +2772,7 @@ static int h1_recv(struct h1c *h1c)
 			h1c->ibuf.head  = sizeof(struct htx);
 		}
 		ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, &h1c->ibuf, max, flags);
+		HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, ret);
 	}
 	if (max && !ret && h1_recv_allowed(h1c)) {
 		TRACE_STATE("failed to receive data, subscribing", H1_EV_H1C_RECV, h1c->conn);
@@ -2689,6 +2828,7 @@ static int h1_send(struct h1c *h1c)
 			h1c->flags &= ~H1C_F_OUT_FULL;
 			TRACE_STATE("h1c obuf not full anymore", H1_EV_STRM_SEND|H1_EV_H1S_BLK, h1c->conn);
 		}
+		HA_ATOMIC_ADD(&h1c->px_counters->bytes_out, ret);
 		b_del(&h1c->obuf, ret);
 		sent = 1;
 	}
@@ -2807,11 +2947,19 @@ static int h1_process(struct h1c * h1c)
 	}
 	h1_send(h1c);
 
-	if ((conn->flags & CO_FL_ERROR) || conn_xprt_read0_pending(conn) || (h1c->flags & H1C_F_ST_ERROR)) {
+	/* H1 connection must be released ASAP if:
+	 *  - an error occurred on the connection or the H1C or
+	 *  - a read0 was received or
+	 *  - a silent shutdown was emitted and all outgoing data sent
+	 */
+	if ((conn->flags & CO_FL_ERROR) ||
+	    conn_xprt_read0_pending(conn) ||
+	    (h1c->flags & H1C_F_ST_ERROR) ||
+	    ((h1c->flags & H1C_F_ST_SILENT_SHUT) && !b_data(&h1c->obuf))) {
 		if (!(h1c->flags & H1C_F_ST_READY)) {
 			/* No conn-stream or not ready */
 			/* shutdown for reads and error on the frontend connection: Send an error */
-			if (!(h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_ERROR))) {
+			if (!(h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_ERROR|H1C_F_ST_SHUTDOWN))) {
 				if (h1_handle_parsing_error(h1c))
 					h1_send(h1c);
 				h1c->flags = (h1c->flags & ~(H1C_F_ST_IDLE|H1C_F_WAIT_NEXT_REQ)) | H1C_F_ST_ERROR;
@@ -2854,7 +3002,8 @@ static int h1_process(struct h1c * h1c)
 	 */
 	if (!(h1c->flags & H1C_F_IS_BACK)) {
 		if (unlikely(h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
-			if (h1c->flags & H1C_F_WAIT_NEXT_REQ)
+			if (!(h1c->px->options & PR_O_IDLE_CLOSE_RESP) &&
+				h1c->flags & H1C_F_WAIT_NEXT_REQ)
 				goto release;
 		}
 	}
@@ -3548,15 +3697,28 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 		goto end;
 	}
 
-	if (h1m->state == H1_MSG_DATA && count > h1m->curr_len)
+	if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN) && count > h1m->curr_len)
 		count = h1m->curr_len;
 	ret = cs->conn->xprt->rcv_pipe(cs->conn, cs->conn->xprt_ctx, pipe, count);
-	if (h1m->state == H1_MSG_DATA && ret >= 0) {
-		h1m->curr_len -= ret;
-		if (!h1m->curr_len) {
-			h1c->flags &= ~H1C_F_WANT_SPLICE;
-			TRACE_STATE("Allow xprt rcv_buf on !curr_len", H1_EV_STRM_RECV, cs->conn, h1s);
+	if (ret >= 0) {
+		if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN)) {
+			if (ret > h1m->curr_len) {
+				h1s->flags |= H1S_F_PARSING_ERROR;
+				h1c->flags |= H1C_F_ST_ERROR;
+				cs->flags  |= CS_FL_ERROR;
+				TRACE_ERROR("too much payload, more than announced",
+					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, cs->conn, h1s);
+				goto end;
+			}
+			h1m->curr_len -= ret;
+			if (!h1m->curr_len) {
+				h1m->state = H1_MSG_DONE;
+				h1c->flags &= ~H1C_F_WANT_SPLICE;
+				TRACE_STATE("payload fully received", H1_EV_STRM_RECV, cs->conn, h1s);
+			}
 		}
+		HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, ret);
+		HA_ATOMIC_ADD(&h1c->px_counters->spliced_bytes_in, ret);
 	}
 
   end:
@@ -3582,19 +3744,38 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 {
 	struct h1s *h1s = cs->ctx;
+	struct h1c *h1c = h1s->h1c;
+	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
 	int ret = 0;
 
 	TRACE_ENTER(H1_EV_STRM_SEND, cs->conn, h1s, 0, (size_t[]){pipe->data});
 
-	if (b_data(&h1s->h1c->obuf)) {
-		if (!(h1s->h1c->wait_event.events & SUB_RETRY_SEND)) {
+	if (b_data(&h1c->obuf)) {
+		if (!(h1c->wait_event.events & SUB_RETRY_SEND)) {
 			TRACE_STATE("more data to send, subscribing", H1_EV_STRM_SEND, cs->conn, h1s);
-			cs->conn->xprt->subscribe(cs->conn, cs->conn->xprt_ctx, SUB_RETRY_SEND, &h1s->h1c->wait_event);
+			cs->conn->xprt->subscribe(cs->conn, cs->conn->xprt_ctx, SUB_RETRY_SEND, &h1c->wait_event);
 		}
 		goto end;
 	}
 
 	ret = cs->conn->xprt->snd_pipe(cs->conn, cs->conn->xprt_ctx, pipe);
+	if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN)) {
+		if (ret > h1m->curr_len) {
+			h1s->flags |= H1S_F_PROCESSING_ERROR;
+			h1c->flags |= H1C_F_ST_ERROR;
+			cs->flags  |= CS_FL_ERROR;
+			TRACE_ERROR("too much payload, more than announced",
+				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, cs->conn, h1s);
+			goto end;
+		}
+		h1m->curr_len -= ret;
+		if (!h1m->curr_len) {
+			h1m->state = H1_MSG_DONE;
+			TRACE_STATE("payload fully xferred", H1_EV_TX_DATA|H1_EV_TX_BODY, cs->conn, h1s);
+		}
+	}
+	HA_ATOMIC_ADD(&h1c->px_counters->bytes_out, ret);
+	HA_ATOMIC_ADD(&h1c->px_counters->spliced_bytes_out, ret);
 
   end:
 	TRACE_LEAVE(H1_EV_STRM_SEND, cs->conn, h1s, 0, (size_t[]){ret});

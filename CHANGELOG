@@ -1,6 +1,121 @@
 ChangeLog :
 ===========
 
+2021/11/23 : 2.6-dev0
+    - MINOR: version: it's development again
+
+2021/11/23 : 2.5.0
+    - BUILD: SSL: add quictls build to scripts/build-ssl.sh
+    - BUILD: SSL: add QUICTLS to build matrix
+    - CLEANUP: sock: Wrap `accept4_broken = 1` into additional parenthesis
+    - BUILD: cli: clear a maybe-unused  warning on some older compilers
+    - BUG/MEDIUM: cli: make sure we can report a warning from a bind keyword
+    - BUG/MINOR: ssl: make SSL counters atomic
+    - CLEANUP: assorted typo fixes in the code and comments
+    - BUG/MINOR: ssl: free correctly the sni in the backend SSL cache
+    - MINOR: version: mention that it's stable now
+
+2021/11/19 : 2.5-dev15
+    - BUG/MINOR: stick-table/cli: Check for invalid ipv6 key
+    - CLEANUP: peers: Remove useless test on peer variable in peer_trace()
+    - DOC: log: Add comments to specify when session's listener is defined or not
+    - BUG/MEDIUM: mux-h1: Handle delayed silent shut in h1_process() to release H1C
+    - REGTESTS: ssl_crt-list_filters: feature cmd incorrectly set
+    - DOC: internals: document the list API
+    - BUG/MINOR: h3: ignore unknown frame types
+    - MINOR: quic: redirect app_ops snd_buf through mux
+    - MEDIUM: quic: inspect ALPN to install app_ops
+    - MINOR: quic: support hq-interop
+    - MEDIUM: quic: send version negotiation packet on unknown version
+    - BUG/MEDIUM: mworker: cleanup the listeners when reexecuting
+    - DOC: internals: document the scheduler API
+    - BUG/MINOR: quic: fix version negotiation packet generation
+    - CLEANUP: ssl: fix wrong #else commentary
+    - MINOR: config: support default values for environment variables
+    - SCRIPTS: run-regtests: reduce the number of processes needed to check options
+    - SCRIPT: run-regtests: avoid several calls to grep to test for features
+    - SCRIPT: run-regtests: avoid calling awk to compute the version
+    - REGTEST: set retries count to zero for all tests that expect at 503
+    - REGTESTS: make tcp-check_min-recv fail fast
+    - REGTESTS: extend the default I/O timeouts and make them overridable
+    - BUG/MEDIUM: ssl: backend TLS resumption with sni and TLSv1.3
+    - BUG/MEDIUM: ssl: abort with the correct SSL error when SNI not found
+    - REGTESTS: ssl: test the TLS resumption
+    - BUILD: makefile: stop opening sub-shells for each and every command
+    - BUILD: makefile: reorder objects by build time
+    - BUG/MEDIUM: mux-h2: always process a pending shut read
+    - MINOR: quic_sock: missing CO_FL_ADDR_TO_SET flag
+    - MINOR: quic: Possible wrong connection identification
+    - MINOR: quic: Correctly pad UDP datagrams
+    - MINOR: quic: Support transport parameters draft TLS extension
+    - MINOR: quic: Anti-amplification implementation
+    - MINOR: quic: Wrong Initial packet connection initialization
+    - MINOR: quic: Wrong ACK range building
+    - MINOR: quic: Update some QUIC protocol errors
+    - MINOR: quic: Send CONNECTION_CLOSE frame upon TLS alert
+    - MINOR: quic: Wrong largest acked packet number parsing
+    - MINOR: quic: Add minimalistic support for stream flow control frames
+    - MINOR: quic: Wrong value for version negotiation packet 'Unused' field
+    - MINOR: quic: Support draft-29 QUIC version
+    - BUG/MINOR: quic: fix segfault on trace for version negotiation
+    - BUG/MINOR: hq-interop: fix potential NULL dereference
+    - BUILD: quic: fix potential NULL dereference on xprt_quic
+    - DOC: lua: documentation about the httpclient API
+    - BUG/MEDIUM: cache/cli: make "show cache" thread-safe
+    - BUG/MEDIUM: shctx: leave the block allocator when enough blocks are found
+    - BUG/MINOR: shctx: do not look for available blocks when the first one is enough
+    - MINOR: shctx: add a few BUG_ON() for consistency checks
+
+2021/11/14 : 2.5-dev14
+    - DEV: coccinelle: Remove unused `expression e`
+    - DEV: coccinelle: Add rule to use `istend()` where possible
+    - CLEANUP: Apply ist.cocci
+    - CLEANUP: Re-apply xalloc_size.cocci
+    - CLEANUP: halog: make the default usage message fit in small screens
+    - MINOR: h3/qpack: fix gcc11 warnings
+    - MINOR: mux-quic: fix gcc11 warning
+    - MINOR: h3: fix potential NULL dereference
+    - MINOR: quic: Fix potential null pointer dereference
+    - CLEANUP: halog: remove unused strl2ui()
+    - OPTIM: halog: improve field parser speed for modern compilers
+    - OPTIM: halog: skip fields 64 bits at a time when supported
+    - DEV: coccinelle: Add rule to use `isttrim()` where possible
+    - CLEANUP: Apply ist.cocci
+    - DEV: coccinelle: Add rule to use `chunk_istcat()` instead of `chunk_memcat()`
+    - DEV: coccinelle: Add rule to use `chunk_istcat()` instead of `chunk_strncat()`
+    - CLEANUP: Apply ist.cocci
+    - CLEANUP: chunk: Remove duplicated chunk_Xcat implementation
+    - CLEANUP: chunk: remove misleading chunk_strncat() function
+    - BUG/MINOR: cache: properly ignore unparsable max-age in quotes
+    - Revert "DEV: coccinelle: Add rule to use `chunk_istcat()` instead of `chunk_strncat()`"
+    - DOC: stats: fix location of the text representation
+    - DOC: internals: document the IST API
+    - BUG/MINOR: httpclient/lua: rcv freeze when no request payload
+    - BUG/MEDIUM: httpclient: channel_add_input() must use htx->data
+    - MINOR: promex: backend aggregated server check status
+    - DOC: config: Fix typo in ssl_fc_unique_id description
+    - BUG/MINOR: http-ana: Apply stop to the current section for http-response rules
+    - Revert "BUG/MINOR: http-ana: Don't eval front after-response rules if stopped on back"
+    - DOC: config: Be more explicit in "allow" actions description
+    - DOC: lua: Be explicit with the Reply object limits
+    - MINOR: mux-h1: Slightly Improve H1 traces
+    - BUG/MEDIUM: conn-stream: Don't reset CS flags on close
+    - CLEANUP: mworker: remove any relative PID reference
+    - MEDIUM: mworker: reexec in waitpid mode after successful loading
+    - MINOR: mworker: clarify starting/failure messages
+    - MINOR: mworker: only increment the number of reload in wait mode
+    - MINOR: mworker: implement a reload failure counter
+    - MINOR: mworker: ReloadFailed shown depending on failedreload
+    - MINOR: mworker: change the way we set PROC_O_LEAVING
+    - BUG/MINOR: mworker: doesn't launch the program postparser
+    - DOC: management: edit the "show proc" example to show the current output
+    - BUG/MEDIUM: httpclient/cli: free of unallocated hc->req.uri
+    - REGTESTS: httpclient/lua: add greater body values
+    - BUG/MINOR: mux-h2: Fix H2_CF_DEM_SHORT_READ value
+    - BUG/MINOR: pools: don't mark ourselves as harmless in DEBUG_UAF mode
+    - BUG/MEDIUM: connection: make cs_shutr/cs_shutw//cs_close() idempotent
+    - BUILD: makefile: simplify detection of libatomic
+
 2021/11/06 : 2.5-dev13
     - SCRIPTS: git-show-backports: re-enable file-based filtering
     - MINOR: jwt: Make invalid static JWT algorithms an error in `jwt_verify` converter

@@ -42,7 +42,8 @@ unsigned char initial_salt_v1[20] = {
 	0xcc, 0xbb, 0x7f, 0x0a
 };
 
-void quic_tls_keys_hexdump(struct buffer *buf, struct quic_tls_secrets *secs);
+void quic_tls_keys_hexdump(struct buffer *buf,
+                           const struct quic_tls_secrets *secs);
 
 void quic_tls_secret_hexdump(struct buffer *buf,
                              const unsigned char *secret, size_t secret_len);
@@ -68,12 +69,19 @@ int quic_tls_decrypt(unsigned char *buf, size_t len,
                      const EVP_CIPHER *aead,
                      const unsigned char *key, const unsigned char *iv);
 
+int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, size_t odcid_len,
+                                          unsigned char *buf, size_t len);
+
 int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
                          const EVP_MD *md,
                          unsigned char *key, size_t keylen,
                          unsigned char *iv, size_t ivlen,
                          unsigned char *hp_key, size_t hp_keylen,
                          const unsigned char *secret, size_t secretlen);
+
+int quic_tls_sec_update(const EVP_MD *md,
+                        unsigned char *new_sec, size_t new_seclen,
+                        const unsigned char *sec, size_t seclen);
 
 int quic_aead_iv_build(unsigned char *iv, size_t ivlen,
                        unsigned char *aead_iv, size_t aead_ivlen, uint64_t pn);
@@ -340,12 +348,64 @@ static inline enum quic_tls_pktns quic_tls_pktns(enum quic_tls_enc_level level)
 	}
 }
 
+/* Erase and free the secrets for a QUIC encryption level with <ctx> as
+ * context.
+ * Always succeeds.
+ */
+static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
+{
+	if (ctx->rx.iv) {
+		memset(ctx->rx.iv, 0, ctx->rx.ivlen);
+		ctx->rx.ivlen = 0;
+	}
+	if (ctx->rx.key) {
+		memset(ctx->rx.key, 0, ctx->rx.keylen);
+		ctx->rx.keylen = 0;
+	}
+	if (ctx->tx.iv) {
+		memset(ctx->tx.iv, 0, ctx->tx.ivlen);
+		ctx->tx.ivlen = 0;
+	}
+	if (ctx->tx.key) {
+		memset(ctx->tx.key, 0, ctx->tx.keylen);
+		ctx->tx.keylen = 0;
+	}
+	pool_free(pool_head_quic_tls_iv,  ctx->rx.iv);
+	pool_free(pool_head_quic_tls_key, ctx->rx.key);
+	pool_free(pool_head_quic_tls_iv,  ctx->tx.iv);
+	pool_free(pool_head_quic_tls_key, ctx->tx.key);
+	ctx->rx.iv = ctx->tx.iv = NULL;
+	ctx->rx.key = ctx->tx.key = NULL;
+}
+
+/* Allocate the secrete keys for a QUIC encryption level with <ctx> as context.
+ * Returns 1 if succeeded, 0 if not.
+ */
+static inline int quic_tls_ctx_keys_alloc(struct quic_tls_ctx *ctx)
+{
+	if (!(ctx->rx.iv = pool_alloc(pool_head_quic_tls_iv)) ||
+	    !(ctx->rx.key = pool_alloc(pool_head_quic_tls_key)) ||
+	    !(ctx->tx.iv = pool_alloc(pool_head_quic_tls_iv)) ||
+	    !(ctx->tx.key = pool_alloc(pool_head_quic_tls_key)))
+		goto err;
+
+	ctx->rx.ivlen = ctx->tx.ivlen = QUIC_TLS_IV_LEN;
+	ctx->rx.keylen = ctx->tx.keylen = QUIC_TLS_KEY_LEN;
+	return 1;
+
+ err:
+	quic_tls_ctx_secs_free(ctx);
+	return 0;
+}
+
 /* Initialize a TLS cryptographic context for the Initial encryption level. */
-static inline void quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
+static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 {
 	ctx->rx.aead = ctx->tx.aead = EVP_aes_128_gcm();
 	ctx->rx.md   = ctx->tx.md   = EVP_sha256();
 	ctx->rx.hp   = ctx->tx.hp   = EVP_aes_128_ctr();
+
+	return quic_tls_ctx_keys_alloc(ctx);
 }
 
 static inline int quic_tls_level_pkt_type(enum quic_tls_enc_level level)
@@ -367,13 +427,16 @@ static inline int quic_tls_level_pkt_type(enum quic_tls_enc_level level)
 /* Set <*level> and <*next_level> depending on <state> QUIC handshake state. */
 static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
                                           enum quic_tls_enc_level *next_level,
-                                          enum quic_handshake_state state)
+                                          enum quic_handshake_state state, int zero_rtt)
 {
 	switch (state) {
 	case QUIC_HS_ST_SERVER_INITIAL:
 	case QUIC_HS_ST_CLIENT_INITIAL:
 		*level = QUIC_TLS_ENC_LEVEL_INITIAL;
-		*next_level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
+		if (zero_rtt)
+			*next_level = QUIC_TLS_ENC_LEVEL_EARLY_DATA;
+		else
+			*next_level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
 		break;
 	case QUIC_HS_ST_SERVER_HANDSHAKE:
 	case QUIC_HS_ST_CLIENT_HANDSHAKE:
@@ -392,7 +455,9 @@ static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
 	return 1;
 }
 
-/* Flag the keys at <qel> encryption level as discarded. */
+/* Flag the keys at <qel> encryption level as discarded.
+ * Note that this function is called only for Initial or Handshake encryption levels.
+ */
 static inline void quic_tls_discard_keys(struct quic_enc_level *qel)
 {
 	qel->tls_ctx.rx.flags |= QUIC_FL_TLS_SECRETS_DCD;
@@ -419,7 +484,9 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 
 	TRACE_ENTER(QUIC_EV_CONN_ISEC);
 	ctx = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx;
-	quic_initial_tls_ctx_init(ctx);
+	if (!quic_initial_tls_ctx_init(ctx))
+		goto err;
+
 	if (!quic_derive_initial_secret(ctx->rx.md,
 	                                salt, salt_len,
 	                                initial_secret, sizeof initial_secret,
@@ -435,16 +502,16 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	rx_ctx = &ctx->rx;
 	tx_ctx = &ctx->tx;
 	if (!quic_tls_derive_keys(ctx->rx.aead, ctx->rx.hp, ctx->rx.md,
-	                          rx_ctx->key, sizeof rx_ctx->key,
-	                          rx_ctx->iv, sizeof rx_ctx->iv,
+	                          rx_ctx->key, rx_ctx->keylen,
+	                          rx_ctx->iv, rx_ctx->ivlen,
 	                          rx_ctx->hp_key, sizeof rx_ctx->hp_key,
 	                          rx_init_sec, sizeof rx_init_sec))
 		goto err;
 
 	rx_ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
 	if (!quic_tls_derive_keys(ctx->tx.aead, ctx->tx.hp, ctx->tx.md,
-	                          tx_ctx->key, sizeof tx_ctx->key,
-	                          tx_ctx->iv, sizeof tx_ctx->iv,
+	                          tx_ctx->key, tx_ctx->keylen,
+	                          tx_ctx->iv, tx_ctx->ivlen,
 	                          tx_ctx->hp_key, sizeof tx_ctx->hp_key,
 	                          tx_init_sec, sizeof tx_init_sec))
 		goto err;
@@ -456,6 +523,65 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 
  err:
 	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_ISEC);
+	return 0;
+}
+
+/* Release the memory allocated for all the key update key phase
+ * structures for <qc> QUIC connection.
+ * Always succeeds.
+ */
+static inline void quic_tls_ku_free(struct quic_conn *qc)
+{
+	pool_free(pool_head_quic_tls_secret, qc->ku.prv_rx.secret);
+	pool_free(pool_head_quic_tls_iv,     qc->ku.prv_rx.iv);
+	pool_free(pool_head_quic_tls_key,    qc->ku.prv_rx.key);
+	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_rx.secret);
+	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_rx.iv);
+	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_rx.key);
+	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_tx.secret);
+	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_tx.iv);
+	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_tx.key);
+}
+
+/* Initialize <kp> key update secrets, allocating the required memory.
+ * Return 1 if all the secrets could be allocated, 0 if not.
+ * This is the responsibility of the caller to release the memory
+ * allocated by this function in case of failure.
+ */
+static inline int quic_tls_kp_init(struct quic_tls_kp *kp)
+{
+	kp->count = 0;
+	kp->pn = 0;
+	kp->flags = 0;
+	kp->secret = pool_alloc(pool_head_quic_tls_secret);
+	kp->secretlen = QUIC_TLS_SECRET_LEN;
+	kp->iv = pool_alloc(pool_head_quic_tls_iv);
+	kp->ivlen = QUIC_TLS_IV_LEN;
+	kp->key = pool_alloc(pool_head_quic_tls_key);
+	kp->keylen = QUIC_TLS_KEY_LEN;
+
+	return kp->secret && kp->iv && kp->key;
+}
+
+/* Initialize all the key update key phase structures for <qc>
+ * QUIC connection, allocating the required memory.
+ * Returns 1 if succeeded, 0 if not.
+ */
+static inline int quic_tls_ku_init(struct quic_conn *qc)
+{
+	struct quic_tls_kp *prv_rx = &qc->ku.prv_rx;
+	struct quic_tls_kp *nxt_rx = &qc->ku.nxt_rx;
+	struct quic_tls_kp *nxt_tx = &qc->ku.nxt_tx;
+
+	if (!quic_tls_kp_init(prv_rx) ||
+	    !quic_tls_kp_init(nxt_rx) ||
+	    !quic_tls_kp_init(nxt_tx))
+		goto err;
+
+	return 1;
+
+ err:
+	quic_tls_ku_free(qc);
 	return 0;
 }
 

@@ -29,6 +29,7 @@
 #include <stdint.h>
 
 #include <import/eb64tree.h>
+#include <import/ebmbtree.h>
 
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
@@ -49,6 +50,11 @@
 extern struct pool_head *pool_head_quic_connection_id;
 
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf);
+
+static inline int qc_is_listener(struct quic_conn *qc)
+{
+	return qc->flags & QUIC_FL_CONN_LISTENER;
+}
 
 /* Update the mux stream-related transport parameters from <qc> connection */
 static inline void quic_transport_params_update(struct quic_conn *qc)
@@ -73,13 +79,19 @@ static inline void quic_cid_cpy(struct quic_cid *dst, const struct quic_cid *src
 	dst->len = src->len;
 }
 
-/* Concatenate the port and address of <saddr> to <cid> QUIC connection ID.
+/* Concatenate the port and address of <saddr> to <cid> QUIC connection ID. The
+ * <addrlen> field of <cid> will be updated with the size of the concatenated
+ * address.
+ *
  * Returns the number of bytes concatenated to <cid>.
  */
-static inline size_t quic_cid_saddr_cat(struct quic_cid *cid, struct sockaddr_storage *saddr)
+static inline size_t quic_cid_saddr_cat(struct quic_cid *cid,
+                                        struct sockaddr_storage *saddr)
 {
 	void *port, *addr;
 	size_t port_len, addr_len;
+
+	cid->addrlen = 0;
 
 	if (saddr->ss_family == AF_INET6) {
 		port = &((struct sockaddr_in6 *)saddr)->sin6_port;
@@ -93,10 +105,11 @@ static inline size_t quic_cid_saddr_cat(struct quic_cid *cid, struct sockaddr_st
 		port_len = sizeof ((struct sockaddr_in *)saddr)->sin_port;
 		addr_len = sizeof ((struct sockaddr_in *)saddr)->sin_addr;
 	}
+
 	memcpy(cid->data + cid->len, port, port_len);
-	cid->len += port_len;
-	memcpy(cid->data + cid->len, addr, addr_len);
-	cid->len += addr_len;
+	cid->addrlen += port_len;
+	memcpy(cid->data + cid->len + port_len, addr, addr_len);
+	cid->addrlen += addr_len;
 
 	return port_len + addr_len;
 }
@@ -106,7 +119,8 @@ static inline size_t quic_cid_saddr_cat(struct quic_cid *cid, struct sockaddr_st
  * debugging purposes.
  * Always succeeds.
  */
-static inline void quic_cid_dump(struct buffer *buf, struct quic_cid *cid)
+static inline void quic_cid_dump(struct buffer *buf,
+                                 const struct quic_cid *cid)
 {
 	int i;
 
@@ -124,8 +138,8 @@ static inline unsigned long quic_get_cid_tid(const struct quic_cid *cid)
 	return cid->data[0] % global.nbthread;
 }
 
-/* Free the CIDs attached to <conn> QUIC connection.
- * Always succeeds.
+/* Free the CIDs attached to <conn> QUIC connection. This must be called under
+ * the CID lock.
  */
 static inline void free_quic_conn_cids(struct quic_conn *conn)
 {
@@ -136,6 +150,11 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 		struct quic_connection_id *cid;
 
 		cid = eb64_entry(&node->node, struct quic_connection_id, seq_num);
+
+		/* remove the CID from the receiver tree */
+		ebmb_delete(&cid->node);
+
+		/* remove the CID from the quic_conn tree */
 		node = eb64_next(node);
 		eb64_delete(&cid->seq_num);
 		pool_free(pool_head_quic_connection_id, cid);
@@ -163,6 +182,7 @@ static inline void quic_connection_id_to_frm_cpy(struct quic_frame *dst,
  * Returns the new CID if succeeded, NULL if not.
  */
 static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
+                                                      struct quic_conn *qc,
                                                       int seq_num)
 {
 	struct quic_connection_id *cid;
@@ -171,7 +191,7 @@ static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
 	if (!cid)
 		return NULL;
 
-	cid->cid.len = QUIC_CID_LEN;
+	cid->cid.len = QUIC_HAP_CID_LEN;
 	if (RAND_bytes(cid->cid.data, cid->cid.len) != 1 ||
 	    RAND_bytes(cid->stateless_reset_token,
 	               sizeof cid->stateless_reset_token) != 1) {
@@ -179,8 +199,11 @@ static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
 		goto err;
 	}
 
+	cid->qc = qc;
+
 	cid->seq_num.key = seq_num;
 	cid->retire_prior_to = 0;
+	/* insert the allocated CID in the quic_conn tree */
 	eb64_insert(root, &cid->seq_num);
 
 	return cid;
@@ -391,10 +414,13 @@ static inline size_t quic_packet_number_length(int64_t pn,
  * enough room in the buffer to copy <pn_len> bytes.
  * Never fails.
  */
-static inline void quic_packet_number_encode(unsigned char **buf,
-                                             const unsigned char *end,
-                                             uint64_t pn, size_t pn_len)
+static inline int quic_packet_number_encode(unsigned char **buf,
+                                            const unsigned char *end,
+                                            uint64_t pn, size_t pn_len)
 {
+	if (end - *buf < pn_len)
+		return 0;
+
 	/* Encode the packet number. */
 	switch (pn_len) {
 	case 1:
@@ -413,6 +439,8 @@ static inline void quic_packet_number_encode(unsigned char **buf,
 		break;
 	}
 	*buf += pn_len;
+
+	return 1;
 }
 
 /* Returns the <ack_delay> field value from <ack_frm> ACK frame for
@@ -459,6 +487,8 @@ static inline void quic_transport_params_init(struct quic_transport_params *p,
 	if (server)
 		p->with_stateless_reset_token      = 1;
 	p->active_connection_id_limit          = 8;
+
+	p->retry_source_connection_id.len = 0;
 
 }
 
@@ -751,6 +781,15 @@ static inline int quic_transport_params_encode(unsigned char *buf,
 		                                  p->original_destination_connection_id.data,
 		                                  p->original_destination_connection_id.len))
 			return 0;
+
+		if (p->retry_source_connection_id.len) {
+			if (!quic_transport_param_enc_mem(&pos, end,
+			                                  QUIC_TP_RETRY_SOURCE_CONNECTION_ID,
+			                                  p->retry_source_connection_id.data,
+			                                  p->retry_source_connection_id.len))
+				return 0;
+		}
+
 		if (p->with_stateless_reset_token &&
 			!quic_transport_param_enc_mem(&pos, end, QUIC_TP_STATELESS_RESET_TOKEN,
 			                              p->stateless_reset_token,
@@ -899,7 +938,7 @@ static inline int quic_transport_params_store(struct quic_conn *conn, int server
  */
 static inline void quic_pktns_init(struct quic_pktns *pktns)
 {
-	MT_LIST_INIT(&pktns->tx.frms);
+	LIST_INIT(&pktns->tx.frms);
 	pktns->tx.next_pn = -1;
 	pktns->tx.pkts = EB_ROOT_UNIQUE;
 	pktns->tx.largest_acked_pn = -1;
@@ -1026,24 +1065,45 @@ static inline int qc_pkt_long(const struct quic_rx_packet *pkt)
 	return pkt->type != QUIC_PACKET_TYPE_SHORT;
 }
 
+/* Return 1 if there is RX packets for <qel> QUIC encryption level, 0 if not */
+static inline int qc_el_rx_pkts(struct quic_enc_level *qel)
+{
+	int ret;
+
+	HA_RWLOCK_RDLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+	ret = !eb_is_empty(&qel->rx.pkts);
+	HA_RWLOCK_RDUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+
+	return ret;
+}
+
 /* Release the memory for the RX packets which are no more referenced
  * and consume their payloads which have been copied to the RX buffer
  * for the connection.
  * Always succeeds.
  */
-static inline void quic_rx_packet_pool_purge(struct quic_conn *qc)
+static inline void quic_rx_pkts_del(struct quic_conn *qc)
 {
 	struct quic_rx_packet *pkt, *pktback;
 
 	list_for_each_entry_safe(pkt, pktback, &qc->rx.pkt_list, qc_rx_pkt_list) {
-		if (pkt->data != (unsigned char *)b_head(&qc->rx.buf))
+		if (pkt->data != (unsigned char *)b_head(&qc->rx.buf)) {
+			size_t cdata;
+
+			cdata = b_contig_data(&qc->rx.buf, 0);
+			if (cdata && !*b_head(&qc->rx.buf)) {
+				/* Consume the remaining data */
+				b_del(&qc->rx.buf, cdata);
+			}
+			break;
+		}
+
+		if (HA_ATOMIC_LOAD(&pkt->refcnt))
 			break;
 
-		if (!HA_ATOMIC_LOAD(&pkt->refcnt)) {
-			b_del(&qc->rx.buf, pkt->raw_len);
-			LIST_DELETE(&pkt->qc_rx_pkt_list);
-			pool_free(pool_head_quic_rx_packet, pkt);
-		}
+		b_del(&qc->rx.buf, pkt->raw_len);
+		LIST_DELETE(&pkt->qc_rx_pkt_list);
+		pool_free(pool_head_quic_rx_packet, pkt);
 	}
 }
 
@@ -1053,30 +1113,14 @@ static inline void quic_rx_packet_refinc(struct quic_rx_packet *pkt)
 	HA_ATOMIC_ADD(&pkt->refcnt, 1);
 }
 
-/* Decrement the reference counter of <pkt> */
+/* Decrement the reference counter of <pkt> while remaining positive */
 static inline void quic_rx_packet_refdec(struct quic_rx_packet *pkt)
 {
-	if (HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1))
-		return;
+	unsigned int refcnt;
 
-	if (!pkt->qc) {
-		/* It is possible the connection for this packet has not already been
-		 * identified. In such a case, we only need to free this packet.
-		 */
-		pool_free(pool_head_quic_rx_packet, pkt);
-	}
-	else {
-		struct quic_conn *qc = pkt->qc;
-
-		HA_RWLOCK_WRLOCK(QUIC_LOCK, &qc->rx.buf_rwlock);
-		if (pkt->data == (unsigned char *)b_head(&qc->rx.buf)) {
-			b_del(&qc->rx.buf, pkt->raw_len);
-			LIST_DELETE(&pkt->qc_rx_pkt_list);
-			pool_free(pool_head_quic_rx_packet, pkt);
-			quic_rx_packet_pool_purge(qc);
-		}
-		HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qc->rx.buf_rwlock);
-	}
+	do {
+		refcnt = HA_ATOMIC_LOAD(&pkt->refcnt);
+	} while (refcnt && !HA_ATOMIC_CAS(&pkt->refcnt, &refcnt, refcnt - 1));
 }
 
 /* Increment the reference counter of <pkt> */
@@ -1092,7 +1136,56 @@ static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 		pool_free(pool_head_quic_tx_packet, pkt);
 }
 
+/* Delete all RX packets for <qel> QUIC encryption level */
+static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
+{
+	struct eb64_node *node;
+
+	HA_RWLOCK_WRLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+	node = eb64_first(&qel->rx.pkts);
+	while (node) {
+		struct quic_rx_packet *pkt =
+			eb64_entry(&node->node, struct quic_rx_packet, pn_node);
+
+		node = eb64_next(node);
+		eb64_delete(&pkt->pn_node);
+		quic_rx_packet_refdec(pkt);
+	}
+	HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+}
+
+static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
+{
+	struct eb64_node *node;
+
+	HA_RWLOCK_RDLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+	node = eb64_first(&qel->rx.pkts);
+	while (node) {
+		struct quic_rx_packet *pkt;
+
+		pkt = eb64_entry(&node->node, struct quic_rx_packet, pn_node);
+		fprintf(stderr, "pkt@%p type=%d pn=%llu\n",
+		        pkt, pkt->type, (ull)pkt->pn_node.key);
+		node = eb64_next(node);
+	}
+	HA_RWLOCK_RDUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+}
+
+static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
+{
+	fprintf(stderr, "REMAINING QEL RX PKTS:\n");
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_APP]);
+}
+
+void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
+
+void quic_set_tls_alert(struct quic_conn *qc, int alert);
+int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
 ssize_t quic_lstnr_dgram_read(struct buffer *buf, size_t len, void *owner,
                               struct sockaddr_storage *saddr);
+
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_XPRT_QUIC_H */

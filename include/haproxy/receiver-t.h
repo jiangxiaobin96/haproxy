@@ -33,6 +33,7 @@
 #define RX_F_BOUND              0x00000001  /* receiver already bound */
 #define RX_F_INHERITED          0x00000002  /* inherited FD from the parent process (fd@) */
 #define RX_F_MWORKER            0x00000004  /* keep the FD open in the master but close it in the children */
+#define RX_F_LOCAL_ACCEPT       0x00000008  /* do not use a tasklet for accept, connections will be accepted on the current thread */
 
 /* Bit values for rx_settings->options */
 #define RX_O_FOREIGN            0x00000001  /* receives on foreign addresses */
@@ -64,7 +65,6 @@ struct receiver {
 	struct rx_settings *settings;    /* points to the settings used by this receiver */
 	struct list proto_list;          /* list in the protocol header */
 #ifdef USE_QUIC
-	struct mt_list pkts;             /* QUIC Initial packets to accept new connections */
 	struct eb_root odcids;           /* QUIC original destination connection IDs. */
 	struct eb_root cids;             /* QUIC connection IDs. */
 	__decl_thread(HA_RWLOCK_T cids_lock); /* RW lock for connection IDs tree accesses */

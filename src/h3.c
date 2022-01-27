@@ -23,7 +23,7 @@
 #include <haproxy/http.h>
 #include <haproxy/htx.h>
 #include <haproxy/istbuf.h>
-#include <haproxy/mux_quic.h>
+#include <haproxy/mux_quic-t.h>
 #include <haproxy/pool.h>
 #include <haproxy/qpack-dec.h>
 #include <haproxy/qpack-enc.h>
@@ -96,11 +96,11 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
 /* Decode <qcs> remotely initiated bidi-stream.
  * Returns <0 on error else 0.
  */
-static int h3_decode_qcs(struct qcs *qcs, void *ctx)
+static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 {
 	struct buffer *rxbuf = &qcs->rx.buf;
 	struct h3 *h3 = ctx;
-	struct htx *htx;
+	struct htx *htx = NULL;
 	struct htx_sl *sl;
 	struct conn_stream *cs;
 	struct http_hdr list[global.tune.max_http_hdr];
@@ -212,11 +212,17 @@ static int h3_decode_qcs(struct qcs *qcs, void *ctx)
 			/* Not supported */
 			break;
 		default:
-			/* Error */
-			h3->err = H3_FRAME_UNEXPECTED;
-			return -1;
+			/* draft-ietf-quic-http34 9. Extensions to HTTP/3
+			 * unknown frame types MUST be ignored
+			 */
+			h3_debug_printf(stderr, "ignore unknown frame type 0x%lx\n", ftype);
 		}
 		b_del(rxbuf, flen);
+	}
+
+	if (htx) {
+		if (fin && !b_data(rxbuf))
+			htx->flags |= HTX_FL_EOM;
 	}
 
 	return 0;
@@ -298,14 +304,20 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 		/* From here, a frame must not be truncated */
 		switch (ftype) {
 		case H3_FT_CANCEL_PUSH:
+			/* XXX TODO XXX */
+			ABORT_NOW();
 			break;
 		case H3_FT_SETTINGS:
 			if (!h3_parse_settings_frm(h3, rxbuf, flen))
 				return 0;
 			break;
 		case H3_FT_GOAWAY:
+			/* XXX TODO XXX */
+			ABORT_NOW();
 			break;
 		case H3_FT_MAX_PUSH_ID:
+			/* XXX TODO XXX */
+			ABORT_NOW();
 			break;
 		default:
 			/* Error */
@@ -315,8 +327,12 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 		b_del(rxbuf, flen);
 	}
 
+	/* Handle the case where remaining data are present in the buffer. This
+	 * can happen if there is an incomplete frame. In this case, subscribe
+	 * on the lower layer to restart receive operation.
+	 */
 	if (b_data(rxbuf))
-		h3->qcc->conn->mux->ruqs_subscribe(h3_uqs->qcs, SUB_RETRY_RECV, &h3->rctrl.wait_event);
+		qcs_subscribe(h3_uqs->qcs, SUB_RETRY_RECV, &h3_uqs->wait_event);
 
 	return 1;
 }
@@ -477,9 +493,6 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 	}
 
-	if ((htx->flags & HTX_FL_EOM) && htx_is_empty(htx) && status >= 200)
-		qcs->flags |= QC_SF_FIN_STREAM;
-
 	return ret;
 
  err:
@@ -526,8 +539,9 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 		b_slow_realign(res, trash.area, b_data(res));
 	}
 
-	/* not enough room for headers and at least one data byte, block the
-	 * stream
+	/* Not enough room for headers and at least one data byte, block the
+	 * stream. It is expected that the conn-stream layer will subscribe on
+	 * SEND.
 	 */
 	if (b_size(&outbuf) <= hsize) {
 		qcs->flags |= QC_SF_BLK_MROOM;
@@ -568,6 +582,8 @@ size_t h3_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int 
 	uint32_t bsize;
 	int32_t idx;
 	int ret;
+
+	fprintf(stderr, "%s\n", __func__);
 
 	htx = htx_from_buf(buf);
 
@@ -653,7 +669,7 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 
 		h3->rctrl.qcs = qcs;
 		h3->rctrl.cb = h3_control_recv;
-		h3->qcc->conn->mux->ruqs_subscribe(qcs, SUB_RETRY_RECV, &h3->rctrl.wait_event);
+		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rctrl.wait_event);
 		break;
 	case H3_UNI_STRM_TP_PUSH_STREAM:
 		/* NOT SUPPORTED */
@@ -666,7 +682,7 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 
 		h3->rqpack_enc.qcs = qcs;
 		h3->rqpack_enc.cb = qpack_decode_enc;
-		h3->qcc->conn->mux->ruqs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_enc.wait_event);
+		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_enc.wait_event);
 		break;
 	case H3_UNI_STRM_TP_QPACK_DECODER:
 		if (h3->rqpack_dec.qcs) {
@@ -676,7 +692,7 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 
 		h3->rqpack_dec.qcs = qcs;
 		h3->rqpack_dec.cb = qpack_decode_dec;
-		h3->qcc->conn->mux->ruqs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_dec.wait_event);
+		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_dec.wait_event);
 		break;
 	default:
 		/* Error */
@@ -690,8 +706,10 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 static int h3_finalize(void *ctx)
 {
 	struct h3 *h3 = ctx;
+	int lctrl_id;
 
-	h3->lctrl.qcs = luqs_new(h3->qcc);
+	lctrl_id = qcs_get_next_id(h3->qcc, QCS_SRV_UNI);
+	h3->lctrl.qcs = qcs_new(h3->qcc, lctrl_id, QCS_SRV_UNI);
 	if (!h3->lctrl.qcs)
 		return 0;
 
@@ -762,7 +780,7 @@ static int h3_uqs_init(struct h3_uqs *h3_uqs, struct h3 *h3,
 static inline void h3_uqs_release(struct h3_uqs *h3_uqs)
 {
 	if (h3_uqs->qcs)
-		qcs_release(h3_uqs->qcs);
+		uni_qcs_free(h3_uqs->qcs);
 }
 
 static inline void h3_uqs_release_all(struct h3 *h3)
@@ -819,5 +837,6 @@ const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
 	.attach_ruqs = h3_attach_ruqs,
 	.decode_qcs  = h3_decode_qcs,
+	.snd_buf     = h3_snd_buf,
 	.finalize    = h3_finalize,
 };

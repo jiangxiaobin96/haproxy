@@ -148,6 +148,7 @@ enum srv_initaddr {
 #define SRV_F_NO_RESOLUTION 0x0800       /* disable runtime DNS resolution on this server */
 #define SRV_F_DYNAMIC      0x1000        /* dynamic server instantiated at runtime */
 #define SRV_F_NON_PURGEABLE 0x2000       /* this server cannot be removed at runtime */
+#define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -342,6 +343,7 @@ struct server {
 			unsigned char *ptr;
 			int size;
 			int allocated_size;
+			char *sni; /* SNI used for the session */
 		} * reused_sess;
 
 		struct ckch_inst *inst; /* Instance of the ckch_store in which the certificate was loaded (might be null if server has no certificate) */
@@ -355,6 +357,7 @@ struct server {
 		char *verify_host;              /* hostname of certificate must match this host */
 		char *ca_file;			/* CAfile to use on verify */
 		char *crl_file;			/* CRLfile to use on verify */
+		char *client_crt;		/* client certificate to send */
 		struct sample_expr *sni;        /* sample expression for SNI */
 		char *npn_str;                  /* NPN protocol string */
 		int npn_len;                    /* NPN protocol string length */

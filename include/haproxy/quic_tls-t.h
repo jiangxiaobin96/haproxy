@@ -37,8 +37,18 @@
 #endif
 #endif
 
-/* The TLS extension (enum) for QUIC transport parameters */
-#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS 0x0039
+/* AEAD iv and secrete key lengths */
+#define QUIC_TLS_IV_LEN     12 /* bytes */
+#define QUIC_TLS_KEY_LEN    32 /* bytes */
+#define QUIC_TLS_SECRET_LEN 64 /* bytes */
+
+/* The TLS extensions for QUIC transport parameters */
+#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS       0x0039
+#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS_DRAFT 0xffa5
+
+extern struct pool_head *pool_head_quic_tls_secret;
+extern struct pool_head *pool_head_quic_tls_iv;
+extern struct pool_head *pool_head_quic_tls_key;
 
 /* QUIC handshake states for both clients and servers. */
 enum quic_handshake_state {
@@ -81,6 +91,20 @@ enum quic_tls_pktns {
 
 extern unsigned char initial_salt[20];
 
+#define QUIC_FL_TLS_KP_BIT_SET (1 << 0)
+/* Key phase used for Key Update */
+struct quic_tls_kp {
+	unsigned char *secret;
+	size_t secretlen;
+	unsigned char *iv;
+	size_t ivlen;
+	unsigned char *key;
+	size_t keylen;
+	uint64_t count;
+	int64_t pn;
+	unsigned char flags;
+};
+
 /* Flag to be used when TLS secrets have been set. */
 #define QUIC_FL_TLS_SECRETS_SET  (1 << 0)
 /* Flag to be used when TLS secrets have been discarded. */
@@ -90,20 +114,26 @@ struct quic_tls_secrets {
 	const EVP_CIPHER *aead;
 	const EVP_MD *md;
 	const EVP_CIPHER *hp;
-	unsigned char key[32];
-	unsigned char iv[12];
+	unsigned char *secret;
+	size_t secretlen;
 	/* Header protection key.
 	* Note: the header protection is applied after packet protection.
 	* As the header belong to the data, its protection must be removed before removing
 	* the packet protection.
 	*/
 	unsigned char hp_key[32];
+	unsigned char *iv;
+	size_t ivlen;
+	unsigned char *key;
+	size_t keylen;
+	int64_t pn;
 	char flags;
 };
 
 struct quic_tls_ctx {
 	struct quic_tls_secrets rx;
 	struct quic_tls_secrets tx;
+	unsigned char flags;
 };
 
 #endif /* USE_QUIC */

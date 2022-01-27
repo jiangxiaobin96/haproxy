@@ -2049,14 +2049,21 @@ static void srv_conn_src_cpy(struct server *srv, struct server *src)
 #if defined(USE_OPENSSL)
 static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 {
+	/* <src> is the current proxy's default server and SSL is enabled */
+	BUG_ON(src->ssl_ctx.ctx != NULL); /* the SSL_CTX must never be initialized in a default-server */
+
+	if (src == &srv->proxy->defsrv && src->use_ssl == 1)
+		srv->flags |= SRV_F_DEFSRV_USE_SSL;
+
 	if (src->ssl_ctx.ca_file != NULL)
 		srv->ssl_ctx.ca_file = strdup(src->ssl_ctx.ca_file);
 	if (src->ssl_ctx.crl_file != NULL)
 		srv->ssl_ctx.crl_file = strdup(src->ssl_ctx.crl_file);
+	if (src->ssl_ctx.client_crt != NULL)
+		srv->ssl_ctx.client_crt = strdup(src->ssl_ctx.client_crt);
 
 	srv->ssl_ctx.verify = src->ssl_ctx.verify;
 
-	srv->ssl_ctx.ctx = src->ssl_ctx.ctx;
 
 	if (src->ssl_ctx.verify_host != NULL)
 		srv->ssl_ctx.verify_host = strdup(src->ssl_ctx.verify_host);
@@ -2109,7 +2116,7 @@ void srv_set_ssl(struct server *s, int use_ssl)
 	if (s->use_ssl)
 		s->xprt = xprt_get(XPRT_SSL);
 	else
-		s->xprt = s->check.xprt = s->agent.xprt = xprt_get(XPRT_RAW);
+		s->xprt = xprt_get(XPRT_RAW);
 }
 
 #endif /* USE_OPENSSL */
@@ -4825,8 +4832,8 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		}
 
 		srv->conf.id.key = srv->puid = next_id;
-		srv->conf.name.key = srv->id;
 	}
+	srv->conf.name.key = srv->id;
 
 	/* insert the server in the backend trees */
 	eb32_insert(&be->conf.used_server_id, &srv->conf.id);

@@ -33,6 +33,8 @@
 
 #include <import/ebtree-t.h>
 
+#include <haproxy/mux_quic-t.h>
+
 /* QUIC frame types. */
 enum quic_frame_type {
 	QUIC_FT_PADDING      = 0x00,
@@ -100,6 +102,8 @@ enum quic_frame_type {
 #define QUIC_STREAM_FRAME_ID_DIR_BIT       0x02
 
 #define QUIC_PATH_CHALLENGE_LEN         8
+/* Maximum phrase length in CONNECTION_CLOSE frame */
+#define QUIC_CC_REASON_PHRASE_MAXLEN   64
 
 struct quic_padding {
 	size_t len;
@@ -124,7 +128,7 @@ struct quic_reset_stream {
 	uint64_t final_size;
 };
 
-struct quic_stop_sending_frame {
+struct quic_stop_sending {
 	uint64_t id;
 	uint64_t app_error_code;
 };
@@ -147,6 +151,7 @@ struct quic_stream {
 	struct buffer *buf;
 	struct eb64_node offset;
 	uint64_t len;
+	int fin;
 	const unsigned char *data;
 };
 
@@ -202,17 +207,16 @@ struct quic_connection_close {
 	uint64_t error_code;
 	uint64_t frame_type;
 	uint64_t reason_phrase_len;
-	unsigned char *reason_phrase;
+	unsigned char reason_phrase[QUIC_CC_REASON_PHRASE_MAXLEN];
 };
 
 struct quic_connection_close_app {
 	uint64_t error_code;
 	uint64_t reason_phrase_len;
-	unsigned char *reason_phrase;
+	unsigned char reason_phrase[QUIC_CC_REASON_PHRASE_MAXLEN];
 };
 
 struct quic_frame {
-	struct mt_list mt_list;
 	struct list list;
 	unsigned char type;
 	union {
@@ -221,7 +225,7 @@ struct quic_frame {
 		struct quic_tx_ack tx_ack;
 		struct quic_crypto crypto;
 		struct quic_reset_stream reset_stream;
-		struct quic_stop_sending_frame stop_sending_frame;
+		struct quic_stop_sending stop_sending;
 		struct quic_new_token new_token;
 		struct quic_stream stream;
 		struct quic_max_data max_data;

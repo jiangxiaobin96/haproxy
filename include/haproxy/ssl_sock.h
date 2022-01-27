@@ -42,11 +42,15 @@ extern struct methodVersions methodVersions[];
 __decl_thread(extern HA_SPINLOCK_T ckch_lock);
 extern struct pool_head *pool_head_ssl_capture;
 extern int ssl_app_data_index;
+#ifdef USE_QUIC
+extern int ssl_qc_app_data_index;
+#endif /* USE_QUIC */
 extern unsigned int openssl_engines_initialized;
 extern int nb_engines;
 extern struct xprt_ops ssl_sock;
 extern int ssl_capture_ptr_index;
 extern int ssl_keylog_index;
+extern int ssl_client_sni_index;
 extern struct pool_head *pool_head_ssl_keylog;
 extern struct pool_head *pool_head_ssl_keylog_str;
 
@@ -60,6 +64,8 @@ void ssl_sock_destroy_bind_conf(struct bind_conf *bind_conf);
 int ssl_sock_prepare_srv_ctx(struct server *srv);
 void ssl_sock_free_srv_ctx(struct server *srv);
 void ssl_sock_free_all_ctx(struct bind_conf *bind_conf);
+int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx,
+                      const char **str, int *len);
 int ssl_sock_load_ca(struct bind_conf *bind_conf);
 void ssl_sock_free_ca(struct bind_conf *bind_conf);
 int ssl_bio_and_sess_init(struct connection *conn, SSL_CTX *ssl_ctx,

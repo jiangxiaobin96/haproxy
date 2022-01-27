@@ -441,6 +441,7 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		while (*args[cur_arg]) {
 			struct bind_kw *kw;
 			const char *best;
+			int code;
 
 			kw = bind_find_kw(args[cur_arg]);
 			if (kw) {
@@ -450,7 +451,19 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 					return -1;
 				}
 
-				if (kw->parse(args, cur_arg, global.cli_fe, bind_conf, err) != 0) {
+				code = kw->parse(args, cur_arg, global.cli_fe, bind_conf, err);
+
+				/* FIXME: this is ugly, we don't have a way to collect warnings,
+				 * yet some important bind keywords may report warnings that we
+				 * must display.
+				 */
+				if (((code & (ERR_WARN|ERR_FATAL|ERR_ALERT)) == ERR_WARN) && err && *err) {
+					indent_msg(err, 2);
+					ha_warning("parsing [%s:%d] : '%s %s' : %s\n", file, line, args[0], args[1], *err);
+					ha_free(err);
+				}
+
+				if (code & ~ERR_WARN) {
 					if (err && *err)
 						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
 					else
@@ -877,9 +890,20 @@ static void cli_io_handler(struct appctx *appctx)
 				break;
 			}
 
-			/* '- 1' is to ensure a null byte can always be inserted at the end */
-			reql = co_getline(si_oc(si), str,
-					  appctx->chunk->size - appctx->chunk->data - 1);
+			/* payload doesn't take escapes nor does it end on semi-colons, so
+			 * we use the regular getline. Normal mode however must stop on
+			 * LFs and semi-colons that are not prefixed by a backslash. Note
+			 * that we reserve one byte at the end to insert a trailing nul byte.
+			 */
+
+			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
+				reql = co_getline(si_oc(si), str,
+				                  appctx->chunk->size - appctx->chunk->data - 1);
+			else
+				reql = co_getdelim(si_oc(si), str,
+				                   appctx->chunk->size - appctx->chunk->data - 1,
+				                   "\n;", '\\');
+
 			if (reql <= 0) { /* closed or EOL not found */
 				if (reql == 0)
 					break;
@@ -1064,6 +1088,17 @@ static void cli_io_handler(struct appctx *appctx)
 			appctx->st0 = CLI_ST_GETREQ;
 			/* reactivate the \n at the end of the response for the next command */
 			appctx->st1 &= ~APPCTX_CLI_ST1_NOLF;
+
+			/* this forces us to yield between pipelined commands and
+			 * avoid extremely long latencies (e.g. "del map" etc). In
+			 * addition this increases the likelihood that the stream
+			 * refills the buffer with new bytes in non-interactive
+			 * mode, avoiding to close on apparently empty commands.
+			 */
+			if (co_data(si_oc(si))) {
+				appctx_wakeup(appctx);
+				goto out;
+			}
 		}
 	}
 
@@ -1368,8 +1403,10 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 		unsigned int _v[MAX_THREADS];				\
 		unsigned int _tot;					\
 		const unsigned int _nbt = global.nbthread;		\
-		for (_tot = t = 0; t < _nbt; t++)			\
+		_tot = t = 0;						\
+		do {							\
 			_tot += _v[t] = (x);				\
+		} while (++t < _nbt);					\
 		if (_nbt == 1) {					\
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
@@ -1386,8 +1423,10 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 		unsigned int _v[MAX_THREADS];				\
 		unsigned int _tot;					\
 		const unsigned int _nbt = global.nbthread;		\
-		for (_tot = t = 0; t < _nbt; t++)			\
+		_tot = t = 0;						\
+		do {							\
 			_tot += _v[t] = (x);				\
+		} while (++t < _nbt);					\
 		if (_nbt == 1) {					\
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
@@ -1737,6 +1776,14 @@ static int cli_parse_expert_experimental_mode(char **args, char *payload, struct
 	if (strcmp(args[1], "on") == 0)
 		appctx->cli_level |= level;
 	return 1;
+}
+
+/* shows HAProxy version */
+static int cli_parse_show_version(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	char *msg = NULL;
+
+	return cli_dynmsg(appctx, LOG_INFO, memprintf(&msg, "%s\n", haproxy_version));
 }
 
 int cli_parse_default(char **args, char *payload, struct appctx *appctx, void *private)
@@ -2231,8 +2278,8 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
  */
 int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int *next_pid)
 {
-	char *str = (char *)ci_head(req);
-	char *end = (char *)ci_stop(req);
+	char *str;
+	char *end;
 	char *args[MAX_CLI_ARGS + 1]; /* +1 for storing a NULL */
 	int argl; /* number of args */
 	char *p;
@@ -2242,6 +2289,15 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	int reql = 0;
 	int ret;
 	int i = 0;
+
+	/* we cannot deal with a wrapping buffer, so let's take care of this
+	 * first.
+	 */
+	if (b_head(&req->buf) + b_data(&req->buf) > b_wrap(&req->buf))
+		b_slow_realign(&req->buf, trash.area, co_data(req));
+
+	str = (char *)ci_head(req);
+	end = (char *)ci_stop(req);
 
 	p = str;
 
@@ -2277,7 +2333,7 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	end = p + reql;
 
 	/* there is no end to this command, need more to parse ! */
-	if (*(end-1) != '\n') {
+	if (!reql || *(end-1) != '\n') {
 		return -1;
 	}
 
@@ -2375,6 +2431,13 @@ int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	int to_forward;
 	char *errmsg = NULL;
 
+	/* Don't read the next command if still processing the response of the
+	 * current one. Just wait. At this stage, errors should be handled by
+	 * the response analyzer.
+	 */
+	if (s->res.analysers & AN_RES_WAIT_CLI)
+		return 0;
+
 	if ((s->pcli_flags & ACCESS_LVL_MASK) == ACCESS_LVL_NONE)
 		s->pcli_flags |= strm_li(s)->bind_conf->level & ACCESS_LVL_MASK;
 
@@ -2387,20 +2450,11 @@ read_again:
 	/* We don't know yet to which server we will connect */
 	channel_dont_connect(req);
 
-
-	/* we are not waiting for a response, there is no more request and we
-	 * receive a close from the client, we can leave */
-	if (!(ci_data(req)) && req->flags & CF_SHUTR) {
-		channel_shutw_now(&s->res);
-		s->req.analysers &= ~AN_REQ_WAIT_CLI;
-		return 1;
-	}
-
 	req->flags |= CF_READ_DONTWAIT;
 
 	/* need more data */
 	if (!ci_data(req))
-		return 0;
+		goto missing_data;
 
 	/* If there is data available for analysis, log the end of the idle time. */
 	if (c_data(req) && s->logs.t_idle == -1)
@@ -2422,13 +2476,6 @@ read_again:
 		}
 
 		s->res.flags |= CF_WAKE_ONCE; /* need to be called again */
-
-		/* remove the XFER_DATA analysers, which forwards all
-		 * the data, we don't want to forward the next requests
-		 * We need to add CF_FLT_ANALYZE to abort the forward too.
-		 */
-		req->analysers &= ~(AN_REQ_FLT_XFER_DATA|AN_REQ_WAIT_CLI);
-		req->analysers |= AN_REQ_FLT_END|CF_FLT_ANALYZE;
 		s->res.analysers |= AN_RES_WAIT_CLI;
 
 		if (!(s->flags & SF_ASSIGNED)) {
@@ -2439,6 +2486,9 @@ read_again:
 			/* we can connect now */
 			s->target = pcli_pid_to_server(target_pid);
 
+			if (!s->target)
+				goto server_disconnect;
+
 			s->flags |= (SF_DIRECT | SF_ASSIGNED);
 			channel_auto_connect(req);
 		}
@@ -2447,13 +2497,14 @@ read_again:
 		/* we trimmed things but we might have other commands to consume */
 		pcli_write_prompt(s);
 		goto read_again;
-	} else if (to_forward == -1 && errmsg) {
-		/* there was an error during the parsing */
-			pcli_reply_and_close(s, errmsg);
-			return 0;
-	} else if (to_forward == -1 && channel_full(req, global.tune.maxrewrite)) {
-		/* buffer is full and we didn't catch the end of a command */
-		goto send_help;
+	} else if (to_forward == -1) {
+                if (errmsg) {
+                        /* there was an error during the parsing */
+                        pcli_reply_and_close(s, errmsg);
+                        s->req.analysers &= ~AN_REQ_WAIT_CLI;
+                        return 0;
+                }
+                goto missing_data;
 	}
 
 	return 0;
@@ -2462,6 +2513,24 @@ send_help:
 	b_reset(&req->buf);
 	b_putblk(&req->buf, "help\n", 5);
 	goto read_again;
+
+missing_data:
+        if (req->flags & CF_SHUTR) {
+                /* There is no more request or a only a partial one and we
+                 * receive a close from the client, we can leave */
+                channel_shutw_now(&s->res);
+                s->req.analysers &= ~AN_REQ_WAIT_CLI;
+                return 1;
+        }
+        else if (channel_full(req, global.tune.maxrewrite)) {
+                /* buffer is full and we didn't catch the end of a command */
+                goto send_help;
+        }
+        return 0;
+
+server_disconnect:
+	pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
+	return 0;
 }
 
 int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
@@ -2471,6 +2540,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 	if (rep->flags & CF_READ_ERROR) {
 		pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
+		s->req.analysers &= ~AN_REQ_WAIT_CLI;
 		s->res.analysers &= ~AN_RES_WAIT_CLI;
 		return 0;
 	}
@@ -2482,7 +2552,6 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	channel_dont_close(&s->req);
 
 	if (s->pcli_flags & PCLI_F_PAYLOAD) {
-		s->req.analysers |= AN_REQ_WAIT_CLI;
 		s->res.analysers &= ~AN_RES_WAIT_CLI;
 		s->req.flags |= CF_WAKE_ONCE; /* need to be called again if there is some command left in the request */
 		return 0;
@@ -2603,7 +2672,6 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		s->req.flags |= CF_WAKE_ONCE; /* need to be called again if there is some command left in the request */
 
-		s->req.analysers |= AN_REQ_WAIT_CLI;
 		s->res.analysers &= ~AN_RES_WAIT_CLI;
 
 		/* We must trim any excess data from the response buffer, because we
@@ -2889,6 +2957,7 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 
 	bind_conf->level &= ~ACCESS_LVL_MASK;
 	bind_conf->level |= ACCESS_LVL_ADMIN; /* TODO: need to lower the rights with a CLI keyword*/
+	bind_conf->level |= ACCESS_FD_LISTENERS;
 
 	if (!memprintf(&path, "sockpair@%d", mworker_proc->ipc_fd[1])) {
 		ha_alert("Cannot allocate listener.\n");
@@ -2955,6 +3024,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "show", "fd", NULL },                "show fd [num]                           : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
 	{ { "show", "activity", NULL },          "show activity                           : show per-thread activity stats (for support/developers)", cli_parse_default, cli_io_handler_show_activity, NULL },
+	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{{},}

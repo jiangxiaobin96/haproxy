@@ -15,11 +15,16 @@
 #include <haproxy/xprt_quic.h>
 
 
+DECLARE_POOL(pool_head_quic_tls_secret, "quic_tls_secret", QUIC_TLS_SECRET_LEN);
+DECLARE_POOL(pool_head_quic_tls_iv,     "quic_tls_iv",     QUIC_TLS_IV_LEN);
+DECLARE_POOL(pool_head_quic_tls_key,    "quic_tls_key",    QUIC_TLS_KEY_LEN);
+
 __attribute__((format (printf, 3, 4)))
 void hexdump(const void *buf, size_t buflen, const char *title_fmt, ...);
 
 /* Dump the RX/TX secrets of <secs> QUIC TLS secrets. */
-void quic_tls_keys_hexdump(struct buffer *buf, struct quic_tls_secrets *secs)
+void quic_tls_keys_hexdump(struct buffer *buf,
+                           const struct quic_tls_secrets *secs)
 {
 	int i;
 	size_t aead_keylen = (size_t)EVP_CIPHER_key_length(secs->aead);
@@ -185,7 +190,7 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
 {
 	size_t aead_keylen = (size_t)EVP_CIPHER_key_length(aead);
 	size_t aead_ivlen = (size_t)EVP_CIPHER_iv_length(aead);
-	size_t hp_len = (size_t)EVP_CIPHER_key_length(hp);
+	size_t hp_len = hp ? (size_t)EVP_CIPHER_key_length(hp) : 0;
 	const unsigned char    key_label[] = "quic key";
 	const unsigned char     iv_label[] = "quic iv";
 	const unsigned char hp_key_label[] = "quic hp";
@@ -197,8 +202,8 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
 	                            key_label, sizeof key_label - 1) ||
 	    !quic_hkdf_expand_label(md, iv, aead_ivlen, secret, secretlen,
 	                            iv_label, sizeof iv_label - 1) ||
-	    !quic_hkdf_expand_label(md, hp_key, hp_len, secret, secretlen,
-	                            hp_key_label, sizeof hp_key_label - 1))
+	    (hp_key && !quic_hkdf_expand_label(md, hp_key, hp_len, secret, secretlen,
+	                                       hp_key_label, sizeof hp_key_label - 1)))
 		return 0;
 
 	return 1;
@@ -255,6 +260,19 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 	    return 0;
 
 	return 1;
+}
+
+/* Update <sec> secret key into <new_sec> according to RFC 9001 6.1.
+ * Always succeeds.
+ */
+int quic_tls_sec_update(const EVP_MD *md,
+                        unsigned char *new_sec, size_t new_seclen,
+                        const unsigned char *sec, size_t seclen)
+{
+	const unsigned char ku_label[] = "quic ku";
+
+	return quic_hkdf_expand_label(md, new_sec, new_seclen, sec, seclen,
+	                              ku_label, sizeof ku_label - 1);
 }
 
 /*
@@ -373,6 +391,62 @@ int quic_tls_decrypt(unsigned char *buf, size_t len,
 	off += outlen;
 
 	ret = off;
+
+ out:
+	EVP_CIPHER_CTX_free(ctx);
+	return ret;
+}
+
+/* Generate the AEAD tag for the Retry packet <pkt> of <pkt_len> bytes and
+ * write it to <tag>. The tag is written just after the <pkt> area. It should
+ * be at least 16 bytes longs. <odcid> is the CID of the Initial packet
+ * received which triggers the Retry.
+ *
+ * Returns non-zero on success else zero.
+ */
+int quic_tls_generate_retry_integrity_tag(unsigned char *odcid,
+                                          unsigned char odcid_len,
+                                          unsigned char *pkt, size_t pkt_len)
+{
+	const EVP_CIPHER *evp = EVP_aes_128_gcm();
+	EVP_CIPHER_CTX *ctx;
+
+	/* key/nonce from rfc9001 5.8. Retry Packet Integrity */
+	const unsigned char key[] = {
+	  0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+	  0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+	};
+	const unsigned char nonce[] = {
+	  0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+	};
+
+	/* encryption buffer - not used as only AEAD tag generation is proceed */
+	unsigned char *out = NULL;
+	/* address to store the AEAD tag */
+	unsigned char *tag = pkt + pkt_len;
+	int outlen, ret = 0;
+
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return 0;
+
+	/* rfc9001 5.8. Retry Packet Integrity
+	 *
+	 * AEAD is proceed over a pseudo-Retry packet used as AAD. It contains
+	 * the ODCID len + data and the Retry packet itself.
+	 */
+	if (!EVP_EncryptInit_ex(ctx, evp, NULL, key, nonce) ||
+	    /* specify pseudo-Retry as AAD */
+	    !EVP_EncryptUpdate(ctx, NULL, &outlen, &odcid_len, sizeof(odcid_len)) ||
+	    !EVP_EncryptUpdate(ctx, NULL, &outlen, odcid, odcid_len) ||
+	    !EVP_EncryptUpdate(ctx, NULL, &outlen, pkt, pkt_len) ||
+	    /* finalize */
+	    !EVP_EncryptFinal_ex(ctx, out, &outlen) ||
+	    /* store the tag */
+	    !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, QUIC_TLS_TAG_LEN, tag)) {
+		goto out;
+	}
+	ret = 1;
 
  out:
 	EVP_CIPHER_CTX_free(ctx);

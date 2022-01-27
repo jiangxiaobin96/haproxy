@@ -42,66 +42,113 @@ int mem_poison_byte = -1;
 static int mem_fail_rate = 0;
 #endif
 
-#if defined(HA_HAVE_MALLOC_TRIM)
-static int using_libc_allocator = 0;
+static int using_default_allocator = 1;
+static int(*my_mallctl)(const char *, void *, size_t *, void *, size_t) = NULL;
 
-/* ask the allocator to trim memory pools */
+/* ask the allocator to trim memory pools.
+ * This must run under thread isolation so that competing threads trying to
+ * allocate or release memory do not prevent the allocator from completing
+ * its job. We just have to be careful as callers might already be isolated
+ * themselves.
+ */
 static void trim_all_pools(void)
 {
-	if (using_libc_allocator)
-		malloc_trim(0);
+	int isolated = thread_isolated();
+
+	if (!isolated)
+		thread_isolate();
+
+	if (my_mallctl) {
+		unsigned int i, narenas = 0;
+		size_t len = sizeof(narenas);
+
+		if (my_mallctl("arenas.narenas", &narenas, &len, NULL, 0) == 0) {
+			for (i = 0; i < narenas; i ++) {
+				char mib[32] = {0};
+				snprintf(mib, sizeof(mib), "arena.%u.purge", i);
+				(void)my_mallctl(mib, NULL, NULL, NULL, 0);
+			}
+		}
+	} else {
+#if defined(HA_HAVE_MALLOC_TRIM)
+		if (using_default_allocator)
+			malloc_trim(0);
+#elif defined(HA_HAVE_MALLOC_ZONE)
+		if (using_default_allocator) {
+			vm_address_t *zones;
+			unsigned int i, nzones;
+
+			if (malloc_get_all_zones(0, NULL, &zones, &nzones) == KERN_SUCCESS) {
+				for (i = 0; i < nzones; i ++) {
+					malloc_zone_t *zone = (malloc_zone_t *)zones[i];
+
+					/* we cannot purge anonymous zones */
+					if (zone->zone_name)
+						malloc_zone_pressure_relief(zone, 0);
+				}
+			}
+		}
+#endif
+	}
+
+	if (!isolated)
+		thread_release();
 }
 
 /* check if we're using the same allocator as the one that provides
  * malloc_trim() and mallinfo(). The principle is that on glibc, both
  * malloc_trim() and mallinfo() are provided, and using mallinfo() we
  * can check if malloc() is performed through glibc or any other one
- * the executable was linked against (e.g. jemalloc).
+ * the executable was linked against (e.g. jemalloc). Prior to this we
+ * have to check whether we're running on jemalloc by verifying if the
+ * mallctl() function is provided. Its pointer will be used later.
  */
 static void detect_allocator(void)
 {
-#ifdef HA_HAVE_MALLINFO2
-	struct mallinfo2 mi1, mi2;
-#else
-	struct mallinfo mi1, mi2;
+#if defined(__ELF__)
+	extern int mallctl(const char *, void *, size_t *, void *, size_t) __attribute__((weak));
+
+	my_mallctl = mallctl;
 #endif
-	void *ptr;
+
+	if (!my_mallctl) {
+		my_mallctl = get_sym_curr_addr("mallctl");
+		using_default_allocator = (my_mallctl == NULL);
+	}
+
+	if (!my_mallctl) {
+#if defined(HA_HAVE_MALLOC_TRIM)
+#ifdef HA_HAVE_MALLINFO2
+		struct mallinfo2 mi1, mi2;
+#else
+		struct mallinfo mi1, mi2;
+#endif
+		void *ptr;
 
 #ifdef HA_HAVE_MALLINFO2
-	mi1 = mallinfo2();
+		mi1 = mallinfo2();
 #else
-	mi1 = mallinfo();
+		mi1 = mallinfo();
 #endif
-	ptr = DISGUISE(malloc(1));
+		ptr = DISGUISE(malloc(1));
 #ifdef HA_HAVE_MALLINFO2
-	mi2 = mallinfo2();
+		mi2 = mallinfo2();
 #else
-	mi2 = mallinfo();
+		mi2 = mallinfo();
 #endif
-	free(DISGUISE(ptr));
+		free(DISGUISE(ptr));
 
-	using_libc_allocator = !!memcmp(&mi1, &mi2, sizeof(mi1));
+		using_default_allocator = !!memcmp(&mi1, &mi2, sizeof(mi1));
+#elif defined(HA_HAVE_MALLOC_ZONE)
+		using_default_allocator = (malloc_default_zone() != NULL);
+#endif
+	}
 }
 
 static int is_trim_enabled(void)
 {
-	return using_libc_allocator;
+	return using_default_allocator;
 }
-#else
-
-static void trim_all_pools(void)
-{
-}
-
-static void detect_allocator(void)
-{
-}
-
-static int is_trim_enabled(void)
-{
-	return 0;
-}
-#endif
 
 /* Try to find an existing shared pool with the same characteristics and
  * returns it, otherwise creates this one. NULL is returned if no memory
@@ -235,10 +282,9 @@ void *pool_alloc_nocache(struct pool_head *pool)
 	swrate_add_scaled(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used, POOL_AVG_SAMPLES/4);
 	_HA_ATOMIC_INC(&pool->used);
 
-#ifdef DEBUG_MEMORY_POOLS
 	/* keep track of where the element was allocated from */
-	*POOL_LINK(pool, ptr) = (void *)pool;
-#endif
+	POOL_DEBUG_SET_MARK(pool, ptr);
+	POOL_DEBUG_TRACE_CALLER(pool, (struct pool_cache_item *)ptr, NULL);
 	return ptr;
 }
 
@@ -256,6 +302,55 @@ void pool_free_nocache(struct pool_head *pool, void *ptr)
 
 #ifdef CONFIG_HAP_POOLS
 
+/* removes up to <count> items from the end of the local pool cache <ph> for
+ * pool <pool>. The shared pool is refilled with these objects in the limit
+ * of the number of acceptable objects, and the rest will be released to the
+ * OS. It is not a problem is <count> is larger than the number of objects in
+ * the local cache. The counters are automatically updated.
+ */
+static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head *ph, uint count)
+{
+	struct pool_cache_item *item;
+	struct pool_item *pi, *head = NULL;
+	uint released = 0;
+	uint cluster = 0;
+	uint to_free_max;
+
+	to_free_max = pool_releasable(pool);
+
+	while (released < count && !LIST_ISEMPTY(&ph->list)) {
+		item = LIST_PREV(&ph->list, typeof(item), by_pool);
+		pool_check_pattern(ph, item, pool->size);
+		LIST_DELETE(&item->by_pool);
+		LIST_DELETE(&item->by_lru);
+
+		if (to_free_max > released || cluster) {
+			pi = (struct pool_item *)item;
+			pi->next = NULL;
+			pi->down = head;
+			head = pi;
+			cluster++;
+			if (cluster >= CONFIG_HAP_POOL_CLUSTER_SIZE) {
+				/* enough to make a cluster */
+				pool_put_to_shared_cache(pool, head, cluster);
+				cluster = 0;
+				head = NULL;
+			}
+		} else
+			pool_free_nocache(pool, item);
+
+		released++;
+	}
+
+	/* incomplete cluster left */
+	if (cluster)
+		pool_put_to_shared_cache(pool, head, cluster);
+
+	ph->count -= released;
+	pool_cache_count -= released;
+	pool_cache_bytes -= released * pool->size;
+}
+
 /* Evicts some of the oldest objects from one local cache, until its number of
  * objects is no more than 16+1/8 of the total number of locally cached objects
  * or the total size of the local cache is no more than 75% of its maximum (i.e.
@@ -265,17 +360,11 @@ void pool_free_nocache(struct pool_head *pool, void *ptr)
 void pool_evict_from_local_cache(struct pool_head *pool)
 {
 	struct pool_cache_head *ph = &pool->cache[tid];
-	struct pool_cache_item *item;
 
-	while (ph->count >= 16 + pool_cache_count / 8 &&
+	while (ph->count >= CONFIG_HAP_POOL_CLUSTER_SIZE &&
+	       ph->count >= 16 + pool_cache_count / 8 &&
 	       pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 3 / 4) {
-		item = LIST_NEXT(&ph->list, typeof(item), by_pool);
-		ph->count--;
-		pool_cache_bytes -= pool->size;
-		pool_cache_count--;
-		LIST_DELETE(&item->by_pool);
-		LIST_DELETE(&item->by_lru);
-		pool_put_to_shared_cache(pool, item);
+		pool_evict_last_items(pool, ph, CONFIG_HAP_POOL_CLUSTER_SIZE);
 	}
 }
 
@@ -295,33 +384,31 @@ void pool_evict_from_local_caches()
 		 */
 		ph = LIST_NEXT(&item->by_pool, struct pool_cache_head *, list);
 		pool = container_of(ph - tid, struct pool_head, cache);
-		LIST_DELETE(&item->by_pool);
-		LIST_DELETE(&item->by_lru);
-		ph->count--;
-		pool_cache_count--;
-		pool_cache_bytes -= pool->size;
-		pool_put_to_shared_cache(pool, item);
+		pool_evict_last_items(pool, ph, CONFIG_HAP_POOL_CLUSTER_SIZE);
 	} while (pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 7 / 8);
 }
 
 /* Frees an object to the local cache, possibly pushing oldest objects to the
  * shared cache, which itself may decide to release some of them to the OS.
  * While it is unspecified what the object becomes past this point, it is
- * guaranteed to be released from the users' perpective.
+ * guaranteed to be released from the users' perpective. A caller address may
+ * be passed and stored into the area when DEBUG_POOL_TRACING is set.
  */
-void pool_put_to_cache(struct pool_head *pool, void *ptr)
+void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller)
 {
 	struct pool_cache_item *item = (struct pool_cache_item *)ptr;
 	struct pool_cache_head *ph = &pool->cache[tid];
 
 	LIST_INSERT(&ph->list, &item->by_pool);
 	LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+	POOL_DEBUG_TRACE_CALLER(pool, item, caller);
 	ph->count++;
+	pool_fill_pattern(ph, item, pool->size);
 	pool_cache_count++;
 	pool_cache_bytes += pool->size;
 
 	if (unlikely(pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 3 / 4)) {
-		if (ph->count >= 16 + pool_cache_count / 8)
+		if (ph->count >= 16 + pool_cache_count / 8 + CONFIG_HAP_POOL_CLUSTER_SIZE)
 			pool_evict_from_local_cache(pool);
 		if (pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE)
 			pool_evict_from_local_caches();
@@ -343,12 +430,89 @@ void pool_gc(struct pool_head *pool_ctx)
 
 #else /* CONFIG_HAP_NO_GLOBAL_POOLS */
 
+/* Tries to refill the local cache <pch> from the shared one for pool <pool>.
+ * This is only used when pools are in use and shared pools are enabled. No
+ * malloc() is attempted, and poisonning is never performed. The purpose is to
+ * get the fastest possible refilling so that the caller can easily check if
+ * the cache has enough objects for its use.
+ */
+void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch)
+{
+	struct pool_cache_item *item;
+	struct pool_item *ret, *down;
+	uint count;
+
+	/* we'll need to reference the first element to figure the next one. We
+	 * must temporarily lock it so that nobody allocates then releases it,
+	 * or the dereference could fail.
+	 */
+	ret = _HA_ATOMIC_LOAD(&pool->free_list);
+	do {
+		while (unlikely(ret == POOL_BUSY)) {
+			__ha_cpu_relax();
+			ret = _HA_ATOMIC_LOAD(&pool->free_list);
+		}
+		if (ret == NULL)
+			return;
+	} while (unlikely((ret = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
+
+	if (unlikely(ret == NULL)) {
+		HA_ATOMIC_STORE(&pool->free_list, NULL);
+		return;
+	}
+
+	/* this releases the lock */
+	HA_ATOMIC_STORE(&pool->free_list, ret->next);
+
+	/* now store the retrieved object(s) into the local cache */
+	count = 0;
+	for (; ret; ret = down) {
+		down = ret->down;
+		/* keep track of where the element was allocated from */
+		POOL_DEBUG_SET_MARK(pool, ret);
+
+		item = (struct pool_cache_item *)ret;
+		POOL_DEBUG_TRACE_CALLER(pool, item, NULL);
+		LIST_INSERT(&pch->list, &item->by_pool);
+		LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+		count++;
+		pool_fill_pattern(pch, item, pool->size);
+	}
+	HA_ATOMIC_ADD(&pool->used, count);
+	pch->count += count;
+	pool_cache_count += count;
+	pool_cache_bytes += count * pool->size;
+}
+
+/* Adds pool item cluster <item> to the shared cache, which contains <count>
+ * elements. The caller is advised to first check using pool_releasable() if
+ * it's wise to add this series of objects there. Both the pool and the item's
+ * head must be valid.
+ */
+void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count)
+{
+	struct pool_item *free_list;
+
+	_HA_ATOMIC_SUB(&pool->used, count);
+	free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+	do {
+		while (unlikely(free_list == POOL_BUSY)) {
+			__ha_cpu_relax();
+			free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+		}
+		_HA_ATOMIC_STORE(&item->next, free_list);
+		__ha_barrier_atomic_store();
+	} while (!_HA_ATOMIC_CAS(&pool->free_list, &free_list, item));
+	__ha_barrier_atomic_store();
+	swrate_add(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used);
+}
+
 /*
  * This function frees whatever can be freed in pool <pool>.
  */
 void pool_flush(struct pool_head *pool)
 {
-	void *next, *temp;
+	struct pool_item *next, *temp, *down;
 
 	if (!pool)
 		return;
@@ -370,8 +534,11 @@ void pool_flush(struct pool_head *pool)
 
 	while (next) {
 		temp = next;
-		next = *POOL_LINK(pool, temp);
-		pool_put_to_os(pool, temp);
+		next = temp->next;
+		for (; temp; temp = down) {
+			down = temp->down;
+			pool_put_to_os(pool, temp);
+		}
 	}
 	/* here, we should have pool->allocated == pool->used */
 }
@@ -390,13 +557,16 @@ void pool_gc(struct pool_head *pool_ctx)
 		thread_isolate();
 
 	list_for_each_entry(entry, &pools, list) {
-		void *temp;
-		//qfprintf(stderr, "Flushing pool %s\n", entry->name);
+		struct pool_item *temp, *down;
+
 		while (entry->free_list &&
 		       (int)(entry->allocated - entry->used) > (int)entry->minavail) {
 			temp = entry->free_list;
-			entry->free_list = *POOL_LINK(entry, temp);
-			pool_put_to_os(entry, temp);
+			entry->free_list = temp->next;
+			for (; temp; temp = down) {
+				down = temp->down;
+				pool_put_to_os(entry, temp);
+			}
 		}
 	}
 
@@ -422,6 +592,59 @@ void pool_gc(struct pool_head *pool_ctx)
 
 #endif /* CONFIG_HAP_POOLS */
 
+/*
+ * Returns a pointer to type <type> taken from the pool <pool_type> or
+ * dynamically allocated. In the first case, <pool_type> is updated to point to
+ * the next element in the list. <flags> is a binary-OR of POOL_F_* flags.
+ * Prefer using pool_alloc() which does the right thing without flags.
+ */
+void *__pool_alloc(struct pool_head *pool, unsigned int flags)
+{
+	void *p = NULL;
+	void *caller = NULL;
+
+#ifdef DEBUG_FAIL_ALLOC
+	if (unlikely(!(flags & POOL_F_NO_FAIL) && mem_should_fail(pool)))
+		return NULL;
+#endif
+
+#if defined(DEBUG_POOL_TRACING)
+	caller = __builtin_return_address(0);
+#endif
+	if (!p)
+		p = pool_get_from_cache(pool, caller);
+	if (unlikely(!p))
+		p = pool_alloc_nocache(pool);
+
+	if (likely(p)) {
+		if (unlikely(flags & POOL_F_MUST_ZERO))
+			memset(p, 0, pool->size);
+		else if (unlikely(!(flags & POOL_F_NO_POISON) && mem_poison_byte >= 0))
+			memset(p, mem_poison_byte, pool->size);
+	}
+	return p;
+}
+
+/*
+ * Puts a memory area back to the corresponding pool. <ptr> be valid. Using
+ * pool_free() is preferred.
+ */
+void __pool_free(struct pool_head *pool, void *ptr)
+{
+	const void *caller = NULL;
+
+#if defined(DEBUG_POOL_TRACING)
+	caller = __builtin_return_address(0);
+#endif
+	/* we'll get late corruption if we refill to the wrong pool or double-free */
+	POOL_DEBUG_CHECK_MARK(pool, ptr);
+
+	if (unlikely(mem_poison_byte >= 0))
+		memset(ptr, mem_poison_byte, pool->size);
+
+	pool_put_to_cache(pool, ptr, caller);
+}
+
 
 #ifdef DEBUG_UAF
 
@@ -438,12 +661,8 @@ void pool_gc(struct pool_head *pool_ctx)
 void *pool_alloc_area_uaf(size_t size)
 {
 	size_t pad = (4096 - size) & 0xFF0;
-	int isolated;
 	void *ret;
 
-	isolated = thread_isolated();
-	if (!isolated)
-		thread_harmless_now();
 	ret = mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (ret != MAP_FAILED) {
 		/* let's dereference the page before returning so that the real
@@ -456,8 +675,6 @@ void *pool_alloc_area_uaf(size_t size)
 	} else {
 		ret = NULL;
 	}
-	if (!isolated)
-		thread_harmless_end();
 	return ret;
 }
 
@@ -474,9 +691,7 @@ void pool_free_area_uaf(void *area, size_t size)
 	if (pad >= sizeof(void *) && *(void **)(area - sizeof(void *)) != area)
 		ABORT_NOW();
 
-	thread_harmless_now();
 	munmap(area - pad, (size + 4095) & -4096);
-	thread_harmless_end();
 }
 
 #endif /* DEBUG_UAF */

@@ -247,6 +247,12 @@ typedef struct { } empty_t;
 #endif
 #endif
 
+/* dl_iterate_phdr() is available in GLIBC 2.2.4 and up. Let's round up to 2.3.x */
+#if defined(USE_DL) && defined(__GNU_LIBRARY__) && (__GLIBC__ > 2 || __GLIBC__ == 2 && __GLIBC_MINOR__ >= 3)
+#define HA_HAVE_DL_ITERATE_PHDR
+#define HA_HAVE_DUMP_LIBS
+#endif
+
 /* malloc_trim() can be very convenient to reclaim unused memory especially
  * from huge pattern files. It's available (and really usable) in glibc 2.8 and
  * above.
@@ -274,15 +280,17 @@ typedef struct { } empty_t;
 #endif
 
 /* macOS has a call similar to malloc_usable_size */
-#if defined(USE_MEMORY_PROFILING) && defined(__APPLE__)
+#if defined(__APPLE__)
 #include <malloc/malloc.h>
 #define malloc_usable_size malloc_size
+#define HA_HAVE_MALLOC_ZONE
 #endif
 
 /* Max number of file descriptors we send in one sendmsg(). Linux seems to be
- * able to send 253 fds per sendmsg(), not sure about the other OSes.
+ * able to send 253 fds per sendmsg(), however musl is limited to 252, not sure
+ * about the other OSes.
  */
-#define MAX_SEND_FD 253
+#define MAX_SEND_FD 252
 
 #endif /* _HAPROXY_COMPAT_H */
 

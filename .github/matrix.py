@@ -74,8 +74,8 @@ for CC in ["gcc", "clang"]:
             "FLAGS": [
                 "USE_ZLIB=1",
                 "USE_OT=1",
-                "OT_INC=${HOME}/opt/include",
-                "OT_LIB=${HOME}/opt/lib",
+                "OT_INC=${HOME}/opt-ot/include",
+                "OT_LIB=${HOME}/opt-ot/lib",
                 "OT_RUNPATH=1",
                 "USE_PCRE=1",
                 "USE_PCRE_JIT=1",
@@ -110,15 +110,16 @@ for CC in ["gcc", "clang"]:
     for ssl in [
         "stock",
         "OPENSSL_VERSION=1.0.2u",
-        "OPENSSL_VERSION=3.0.0",
+        "OPENSSL_VERSION=3.0.1",
         "LIBRESSL_VERSION=2.9.2",
         "LIBRESSL_VERSION=3.3.3",
+        "QUICTLS=yes",
 #        "BORINGSSL=yes",
     ]:
         flags = ["USE_OPENSSL=1"]
-        if ssl == "BORINGSSL=yes":
+        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes":
             flags.append("USE_QUIC=1")
-        if "OPENSSL_VERSION=3.0.0" in ssl:
+        if "OPENSSL_VERSION=3.0." in ssl or ssl == "QUICTLS=yes":
             flags.append('DEBUG_CFLAGS="-g -Wno-deprecated-declarations"')
         if ssl != "stock":
             flags.append("SSL_LIB=${HOME}/opt/lib")
@@ -149,8 +150,8 @@ matrix.append(
         + [
             "USE_ZLIB=1",
             "USE_OT=1",
-            "OT_INC=${HOME}/opt/include",
-            "OT_LIB=${HOME}/opt/lib",
+            "OT_INC=${HOME}/opt-ot/include",
+            "OT_LIB=${HOME}/opt-ot/lib",
             "OT_RUNPATH=1",
             "USE_PCRE=1",
             "USE_PCRE_JIT=1",

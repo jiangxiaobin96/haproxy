@@ -388,7 +388,7 @@
 /* Pools are always enabled unless explicitly disabled. When disabled, the
  * calls are directly passed to the underlying OS functions.
  */
-#if !defined(DEBUG_NO_POOLS) && !defined(DEBUG_UAF) && !defined(DEBUG_FAIL_ALLOC)
+#if !defined(DEBUG_NO_POOLS) && !defined(DEBUG_UAF)
 #define CONFIG_HAP_POOLS
 #endif
 
@@ -404,7 +404,11 @@
 
 /* default per-thread pool cache size when enabled */
 #ifndef CONFIG_HAP_POOL_CACHE_SIZE
-#define CONFIG_HAP_POOL_CACHE_SIZE 1048576
+#define CONFIG_HAP_POOL_CACHE_SIZE 524288
+#endif
+
+#ifndef CONFIG_HAP_POOL_CLUSTER_SIZE
+#define CONFIG_HAP_POOL_CLUSTER_SIZE 8
 #endif
 
 /* Number of samples used to compute the times reported in stats. A power of
